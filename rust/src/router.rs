@@ -22,6 +22,18 @@ pub enum Router {
     },
     CacheAware {
         /*
+            cjm_note:
+            缓存感知的负载均衡路由器
+            里面包含有两种策略：1. 基于近似基数树的缓存感知的数据分发（当负载均衡时使用），
+                                 每个worker都会基于历史请求信息各自维护一个近似基数树，树里存的是原始文本而不是token id，以免频繁调用tokenization。
+                                 abc. 每个请求进来，会检索每个worker各自维护的树，找到一个具有最大的前缀匹配的。
+                                    如果匹配率大于阈值，则直接分发(缓存最相关)；如果小于等于阈值，则分发到树最小(可用缓存容量最大)的worker中。
+                                 d. 定期使用LRU(least recently used)清理叶子节点，防止内存溢出。
+                              2. 最短队列的负载均衡（当负载不均衡时使用），将新请求分发到待处理请求数最少的worker中。
+            负载均衡的判断条件是：
+            1. (max - min) > abs_threshold，待处理请求数的最大值与最小值的差距大于阈值。
+            2. max > rel_threshold * min，待处理请求数的最小值乘以一个系数后仍比最大值小。
+
             Cache-Aware Load Balancing Router
 
             This router combines two strategies to optimize both cache utilization and request distribution:

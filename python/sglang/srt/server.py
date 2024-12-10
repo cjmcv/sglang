@@ -414,7 +414,7 @@ async def retrieve_file_content(file_id: str):
     # https://platform.openai.com/docs/api-reference/files/retrieve-contents
     return await v1_retrieve_file_content(file_id)
 
-
+# 主进程跑TokenizerManager，另外开两个子进程分别跑Scheduler 和 DetokenizerManager。
 def launch_engine(
     server_args: ServerArgs,
 ):
@@ -439,6 +439,7 @@ def launch_engine(
         server_args.model_path, server_args.tokenizer_path
     )
 
+    # 不使用Data并行，则使用Tensor并行，不支持流水线并行
     if server_args.dp_size == 1:
         # Launch tensor parallel scheduler processes
         scheduler_procs = []
@@ -503,7 +504,12 @@ def launch_engine(
     # Assume all schedulers have same max_total_num_tokens
     scheduler_info = scheduler_infos[0]
 
-
+# 从主入口launch_server.py 在解析了命令行参数后，得到ServerArgs，进入到这里。
+# 1. 创建http服务器，并对engine进行路由调度
+# 2. 创建SGLang运行时engine（launch_engine）
+#      1）TokenizerManager：将请求转为tokens（标记化）并发送给scheduler
+#      2）Scheduler：接收从TokenizerManager发送过来的请求，安排组成batches进行推理计算，并将输出的tokens发送给DetokenizerManager。
+#      3）DetokenizerManager：将输出的tokens逆标记化为人类可读的文本格式，并发送回给Tokenizer Manager。
 def launch_server(
     server_args: ServerArgs,
     pipe_finish_writer: Optional[mp.connection.Connection] = None,

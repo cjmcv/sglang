@@ -45,7 +45,8 @@ def resolve_future_token_ids(input_ids, future_token_ids_map):
         input_ids,
     )
 
-
+# overlap模式下，对TpModelWorker的进一步封装，里面会多开一个forward_thread，并绑定cuda stream，专门用于模型推理。
+# 配有input_queue和output_queue. 主线程送数据到input_queue, 单独的forward_thread会持续读取input_queue，并进行推理。
 class TpModelWorkerClient:
     """A tensor parallel model worker."""
 
@@ -114,6 +115,7 @@ class TpModelWorkerClient:
             if not model_worker_batch:
                 break
 
+            # 将model_worker_batch维系在batch_lists中，以免被释放。
             # Keep a reference of model_worker_batch by storing it into a list.
             # Otherwise, the tensor members of model_worker_batch will be released
             # by pytorch and cause CUDA illegal memory access errors.
@@ -192,6 +194,7 @@ class TpModelWorkerClient:
         # A cuda stream sync here to avoid the cuda illegal memory access error.
         torch.cuda.current_stream().synchronize()
 
+        # 推送数据到input_queue中，在forward_thread中会while(True)循环获取input_queue的数据进行推计算(forward_thread_func_)
         # Push a new batch to the queue
         self.input_queue.put((model_worker_batch, self.future_token_ids_ct))
 

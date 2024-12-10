@@ -7,6 +7,7 @@ from sglang.srt.server import launch_server
 from sglang.srt.server_args import prepare_server_args
 from sglang.srt.utils import kill_process_tree
 
+# 主入口： python -m sglang.launch_server 。。。
 if __name__ == "__main__":
     server_args = prepare_server_args(sys.argv[1:])
 

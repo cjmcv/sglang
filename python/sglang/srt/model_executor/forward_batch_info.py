@@ -51,6 +51,7 @@ class ForwardMode(IntEnum):
     # Prefill a new sequence. This is deprecated now. "EXTEND" covers this case.
     PREFILL = auto()
     # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
+    # 用于在给定已生成的文本序列基础上，预测下一个或多个词（或 token）。它的重点在于对文本序列进行延伸，就像是续写故事一样
     EXTEND = auto()
     # Decode one token.
     DECODE = auto()
@@ -207,6 +208,7 @@ class ForwardBatch:
         )
         self.mrope_positions = self.mrope_positions.to(torch.int64)
 
+    # 用@classmethod修饰，cls指向类本身，即可通过类名直接访问该函数进行类对象的构建。
     @classmethod
     def init_new(
         cls,
@@ -215,6 +217,7 @@ class ForwardBatch:
     ):
 
         device = model_runner.device
+        # cls() 即为 ForwardBatch的构造与成员变量的赋值
         ret = cls(
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),

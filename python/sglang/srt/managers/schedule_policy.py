@@ -32,7 +32,7 @@ CLIP_MAX_NEW_TOKENS_ESTIMATION = int(
     os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", "4096")
 )
 
-
+# 调度策略，
 class SchedulePolicy:
     def __init__(self, policy: str, tree_cache: BasePrefixCache):
         if tree_cache.disable and policy in ["lpm", "dfs-weight"]:

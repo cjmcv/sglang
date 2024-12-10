@@ -90,7 +90,7 @@ logger = logging.getLogger(__name__)
 # Test retract decode
 test_retract = get_bool_env_var("SGLANG_TEST_RETRACT")
 
-
+# 调度器，核心类，管理用于张量并行的GPUworker（不并行 / 张量并行 / 数据并行都会使用张量并行的tp_worker，不支持流水线并行）
 class Scheduler:
     """A scheduler that manages a tensor parallel GPU worker."""
 
@@ -104,8 +104,8 @@ class Scheduler:
     ):
         # Parse args
         self.server_args = server_args
-        self.tp_rank = tp_rank
-        self.tp_size = server_args.tp_size
+        self.tp_rank = tp_rank              # worker编号，0号worker有特殊功能工作
+        self.tp_size = server_args.tp_size  # worker数量
         self.schedule_policy = server_args.schedule_policy
         self.disable_jump_forward = server_args.disable_jump_forward
         self.lora_paths = server_args.lora_paths
@@ -121,9 +121,11 @@ class Scheduler:
         context = zmq.Context(2)
 
         if self.tp_rank == 0 or self.server_args.enable_dp_attention:
+            # scheduler 从 tokenizer 中接收数据
             self.recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name
             )
+            # scheduler 发送数据给 tokenizer.
             self.send_to_tokenizer = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name
             )
@@ -173,6 +175,7 @@ class Scheduler:
                     trust_remote_code=server_args.trust_remote_code,
                 )
 
+        # 只有生成式模型可以使用overlap模式，
         # Check whether overlap can be enabled
         if not self.is_generation:
             self.enable_overlap = False
@@ -185,6 +188,7 @@ class Scheduler:
         if self.enable_overlap:
             self.disable_jump_forward = True
 
+        # overlap模式下，会对TpModelWorker做进一步的封装，使用TpModelWorkerClient，里面会用到TpModelWorker作为成员worker
         # Launch a tensor parallel worker
         if self.enable_overlap:
             TpWorkerClass = TpModelWorkerClient
@@ -229,6 +233,14 @@ class Scheduler:
         # Init memory pool and cache
         self.req_to_token_pool, self.token_to_kv_pool = self.tp_worker.get_memory_pool()
 
+        # cjm_note: 
+        # 如未明确指定chunked_prefill_size且未明确关闭RadixCache，则默认使用RadixCache
+        # ChunkCache和RadixCache均是BasePrefixCache的派生类，二者都用了prefix cache的方式进行
+        # ChunkCache对应普通的chunk prefill加上生硬的匹配(在字典中逐个查找)达到prefixCache的效果
+        # RadixCache则对应RadixAttention，使用基数树去去构建和匹配前缀，以达到prefixCache的效果
+        # 
+        # Chunked prefill是将长度不一的prefill拆分成多个大小相同的块，其次这些 chunks 间的气泡可以插入/捎带（piggyback）其他完成了prefill的prompts的decode需求，与decode组成batch一起计算。
+        # RadixAttention也是按小分块来进行的，也会把prefill分成小块，额外使用了基数树来管理前缀。
         if (
             server_args.chunked_prefill_size is not None
             and server_args.disable_radix_cache
@@ -252,7 +264,7 @@ class Scheduler:
         self.running_batch: Optional[ScheduleBatch] = None
         # The current forward batch
         self.cur_batch: Optional[ScheduleBatch] = None
-        # The current forward batch
+        # The current forward batch，上一个batch
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
         self.forward_ct_decode = 0
@@ -400,9 +412,11 @@ class Scheduler:
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         result_queue = deque()
 
+        # Scheduler会一直循环从zmq接收来自TokenizerManager发送过来的请求，
+        # 安排组成batches进行推理计算，并将输出的tokens发送给DetokenizerManager。
         while True:
-            recv_reqs = self.recv_requests()
-            self.process_input_requests(recv_reqs)
+            recv_reqs = self.recv_requests()   # zmq接收请求
+            self.process_input_requests(recv_reqs) # 根据请求指令做相关处理，该请求指令
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -488,6 +502,7 @@ class Scheduler:
         idle_batch.prepare_for_idle()
         return idle_batch
 
+    # 如果使用数据并行(DP)，则每个worker都会接收请求，否则只有0号worker会接收。
     def recv_requests(self):
         if self.tp_rank == 0 or self.server_args.enable_dp_attention:
             recv_reqs = []
@@ -508,9 +523,9 @@ class Scheduler:
     def process_input_requests(self, recv_reqs: List):
         for recv_req in recv_reqs:
             if isinstance(recv_req, TokenizedGenerateReqInput):
-                self.handle_generate_request(recv_req)
+                self.handle_generate_request(recv_req)   # 处理分词后的新请求，加入到对应session的等待队列中
             elif isinstance(recv_req, TokenizedEmbeddingReqInput):
-                self.handle_embedding_request(recv_req)
+                self.handle_embedding_request(recv_req)  # TokenizedGenerateReqInput里也可有input_embeds，这个指令是直接给input_embeds
             elif isinstance(recv_req, FlushCacheReq):
                 self.flush_cache()
             elif isinstance(recv_req, AbortReq):
@@ -555,7 +570,6 @@ class Scheduler:
     ):
         # Create a new request
         if recv_req.session_id is None or recv_req.session_id not in self.sessions:
-
             if recv_req.input_embeds is not None:
                 # Generate fake input_ids based on the length of input_embeds
                 seq_length = len(recv_req.input_embeds)
@@ -573,18 +587,24 @@ class Scheduler:
             req.tokenizer = self.tokenizer
 
             if recv_req.session_id is not None:
+                # 即session_id是有的，但是在self.sessions里没找到，直接送到worker的等待队列中。
                 req.finished_reason = FINISH_ABORT(
                     f"Invalid request: session id {recv_req.session_id} does not exist"
                 )
                 self.waiting_queue.append(req)
                 return
         else:
+            # 在已有的session基础上，根据接收到的请求信息，创建新请求，送到worker的等待队列中。
+            # session里会包含所有它创建的历史请求。
             # Create a new request from a previsou session
             session = self.sessions[recv_req.session_id]
             req = session.create_req(recv_req, self.tokenizer)
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self.waiting_queue.append(req)
                 return
+
+        # 来到这里，说明recv_req.session_id是None的。
+        # 填充新Req的各种信息，同时为该req初始化语法缓存(garmmar cache, 用于约束生成的词)
 
         # Handle image inputs
         if recv_req.image_inputs is not None:
@@ -768,6 +788,7 @@ class Scheduler:
     def get_next_batch_to_run(self):
         # Merge the prefill batch into the running batch
         if self.last_batch and self.last_batch.forward_mode.is_extend():
+            # 如果该请求已经被chunked分块，则将已分块的请求从batch里移出。并放入到tree_cache中
             if self.being_chunked_req:
                 # Move the chunked request out of the batch
                 self.last_batch.filter_batch(being_chunked_req=self.being_chunked_req)
@@ -776,6 +797,7 @@ class Scheduler:
                 self.req_to_token_pool.free(self.being_chunked_req.req_pool_idx)
                 self.batch_is_full = False
 
+            # 填入last_batch到running_batch中
             if not self.last_batch.is_empty():
                 if self.running_batch is None:
                     self.running_batch = self.last_batch
@@ -783,6 +805,11 @@ class Scheduler:
                     self.running_batch.merge_batch(self.last_batch)
 
         # Run prefill first if possible
+        # 获取一个new_batch: 
+        # 包含留下being_chunked_req中未完成的请求，
+        # 从waiting queue中获取新请求，填充PrefillAdder.can_run_list，并由ScheduleBatch.init_new生成一个新的batch
+        # bacth满了或者没有新的请求，get_new_batch_prefill会返回None，则会走下面的update_running_batch。
+        # get_new_batch_prefill有new_batch返回，则running_batch已经被混合到new_batch中了，running_batch不再需要update了。
         new_batch = self.get_new_batch_prefill()
         if new_batch is not None:
             return new_batch
@@ -826,7 +853,7 @@ class Scheduler:
         has_being_chunked = self.being_chunked_req is not None
         if has_being_chunked:
             self.being_chunked_req.init_next_round_input()
-            self.being_chunked_req = adder.add_being_chunked_req(self.being_chunked_req)
+            self.being_chunked_req = adder.add_being_chunked_req(self.being_chunked_req) # 过滤出未完成的请求
 
         if self.lora_paths:
             lora_set = (
@@ -836,6 +863,7 @@ class Scheduler:
             )
 
         # Get requests from the waiting queue to a new prefill batch
+        # 从waiting queue中拿到请求，由adder.add_one_req中放到can_run_list中暂存
         for req in self.waiting_queue:
             if (
                 self.lora_paths
@@ -854,13 +882,13 @@ class Scheduler:
                 break
 
             req.init_next_round_input(None if prefix_computed else self.tree_cache)
-            res = adder.add_one_req(req)
+            res = adder.add_one_req(req) # 会赋值adder.new_being_chunked_req，并append can_run_list
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
                     self.batch_is_full = True
                 break
 
-        # Update waiting queue
+        # Update waiting queue，去掉self.waiting_queue中已被填到can_run_list中的元素。
         can_run_list = adder.can_run_list
         if len(can_run_list) == 0:
             return None
@@ -888,8 +916,9 @@ class Scheduler:
             self.model_config,
             self.enable_overlap,
         )
-        new_batch.prepare_for_extend()
+        new_batch.prepare_for_extend()  # self.forward_mode都会被置为extend
 
+        # 将running_batch打包到new_batch，并将forward_mode设为mixed，将running_batch清空。
         # Mixed-style chunked prefill
         if (
             self.is_mixed_chunk
@@ -899,8 +928,8 @@ class Scheduler:
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             self.running_batch.filter_batch()
             if not self.running_batch.is_empty():
-                self.running_batch.prepare_for_decode()
-                new_batch.mix_with_running(self.running_batch)
+                self.running_batch.prepare_for_decode() # self.forward_mode都会被置为extend
+                new_batch.mix_with_running(self.running_batch) # self.forward_mode被置为MIXED
                 new_batch.decoding_reqs = self.running_batch.reqs
             self.running_batch = None
         else:
@@ -957,7 +986,7 @@ class Scheduler:
         """Run a batch."""
         self.forward_ct += 1
 
-        if self.is_generation:
+        if self.is_generation:  # 生成式模型
             model_worker_batch = batch.get_model_worker_batch()
             if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
                 logits_output, next_token_ids = self.tp_worker.forward_batch_generation(

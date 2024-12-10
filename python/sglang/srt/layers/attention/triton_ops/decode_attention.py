@@ -26,7 +26,9 @@ from sglang.srt.utils import is_hip
 
 is_hip_ = is_hip()
 
-
+# tanh的公式是(e^x - e^-x) / (e^x + e^-x)
+# sigmoid的公式是 1/ (1 + e^-x)
+# 可以换算由sigmoid得到tanh
 @triton.jit
 def tanh(x):
     # Tanh is just a scaled sigmoid
@@ -681,7 +683,7 @@ def decode_attention_fwd(
     kv_group_num = q.shape[1] // v_buffer.shape[1]
 
     if kv_group_num == 1:
-        # MHA
+        # MHA (Multi Head Attention)
         decode_attention_fwd_normal(
             q,
             k_buffer,
@@ -698,6 +700,13 @@ def decode_attention_fwd(
         )
     else:
         # GQA/MQA/MLA
+        # GQA（Grouped-Query Attention）
+        #     在传统的多头注意力（MHA）机制中，每个注意力头都有自己独立的键（Key）、值（Value）和查询（Query）。
+        #     而 GQA 对其进行了改进，它将多个注意力头分组，组内的头共享相同的键和值，不同组有不同的键和值。此时Q和KV的头数量不一致。
+        # MQA（Multi-Query Attention）
+        #     一种更激进的注意力机制优化策略。在 MQA 中，所有的注意力头都共享相同的键和值，只有查询是每个头独立的。
+        # MLA（Multi-head Latent Attention）
+        #     DeepSeek-V2 所使用的一种注意力机制，在多头注意力的基础上引入潜在的表示，来更好地捕捉输入信息中的潜在特征. 如通过低秩投影压缩 KV Cache 的大小，以达到比 GQA 更省内存且效果更好的目的.
         decode_attention_fwd_grouped(
             q,
             k_buffer,

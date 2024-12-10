@@ -145,6 +145,13 @@ class TpModelWorker:
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         self.model_runner.forward(forward_batch)
 
+    # 推理计算入口函数，调用
+    # model_runner.forward
+    #                 -> forward_decode / forward_extend
+    #                    -> model.forward 
+    #                                 -> models/qwen2.py: forward 里面会定义 self.attn = RadixAttention()
+    # RadixAttention在python/sglang/srt/layers/radix_attention.py, 其forward会调用到attention的backend，如(python/sglang/srt/layers/attention/triton_backend.py)
+    # 里面还会根据forward_batch.forward_mode.is_decode()来选择调用decode_kernel还是extern_kernel.
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,

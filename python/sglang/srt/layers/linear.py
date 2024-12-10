@@ -638,7 +638,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             shard_size=shard_size,
         )
 
-
+# 线性层(全连接层)，用于attention的QKV的线性变换。权重矩阵沿着输出维度拼接在一起，layer则沿着head维度并行。
 class QKVParallelLinear(ColumnParallelLinear):
     """Linear layers for the attention's QKV transformation.
 
