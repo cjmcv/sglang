@@ -80,7 +80,7 @@ class ServerArgs:
     log_level_http: Optional[str] = None
     log_requests: bool = False
     show_time_cost: bool = False
-    enable_metrics: bool = False
+    enable_metrics: bool = True
     decode_log_interval: int = 40
 
     # API related
@@ -89,7 +89,6 @@ class ServerArgs:
     enable_cache_report: bool = False
 
     # Data parallelism
-    # cjm_note:
     # load_balance_method
     #   round_robin: 轮询，多个GPU排成一圈，按顺序一份一份轮流分发数据，达到简单有效的负载均衡效果。但会忽略设备性能差异和数据局部性的问题。
     #   cache_aware: 缓存感知，细节在rust/src/router.rs#28，这里无法选择，需要通过sglang_router.launch_server使用

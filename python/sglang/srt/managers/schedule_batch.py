@@ -205,7 +205,7 @@ class Req:
         session_id: Optional[str] = None,
     ):
         # Input and output info
-        self.rid = rid
+        self.rid = rid    # request的id号
         self.origin_input_text = origin_input_text
         self.origin_input_ids_unpadded = (
             origin_input_ids_unpadded
@@ -661,14 +661,15 @@ class ScheduleBatch:
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
 
-        bs = len(self.reqs)
+        bs = len(self.reqs) # 会有多个请求序列
         reqs = self.reqs
+        # len(r.prefix_indices)即该请求r的前缀数量，总数去掉前缀部分，剩下的就是extend的(输入)大小
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
-        extend_num_tokens = sum(len(ids) for ids in input_ids)
+        extend_num_tokens = sum(len(ids) for ids in input_ids) # 将所有req的extend大小都累加起来，就是本次处理的extend总token数，可用于内存分配。
         seq_lens = []
         pre_lens = []
 
-        # Allocate memory
+        # Allocate memory，入口信息，用于索引。
         req_pool_indices = self.alloc_req_slots(bs)
         out_cache_loc = self.alloc_token_slots(extend_num_tokens)
 
@@ -684,9 +685,9 @@ class ScheduleBatch:
             req.cached_tokens += len(req.prefix_indices) - already_computed
 
             req.req_pool_idx = req_pool_indices[i]
-            pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids)
-            seq_lens.append(seq_len)
-            assert seq_len - pre_len == req.extend_input_len
+            pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids) # pre_len是前缀长度；eq_len是seq总长度，包含前缀长度和本次extend的长度
+            seq_lens.append(seq_len)                                      # seq_lens的每个元素表示该请求所对应的序列的长度。
+            assert seq_len - pre_len == req.extend_input_len              # 二次核验: 序列长度 - 前缀长度 = extend长度
 
             if pre_len > 0:
                 self.req_to_token_pool.write(
@@ -900,22 +901,24 @@ class ScheduleBatch:
 
     def check_for_jump_forward(self, pad_input_ids_func):
         jump_forward_reqs = []
-        keep_indices = set(i for i in range(len(self.reqs)))
+        keep_indices = set(i for i in range(len(self.reqs))) # 当前请求数的标号
 
+        # 遍历该batch内的所有seq
         for i, req in enumerate(self.reqs):
             if req.grammar is not None:
+                # 查找是否有可跳转的部分
                 jump_helper = req.grammar.try_jump_forward(req.tokenizer)
                 if jump_helper:
-                    suffix_ids, _ = jump_helper
+                    suffix_ids, _ = jump_helper  # suffix_ids 即为可跳转的部分，对于outlines是可跳转decode id，对于xgrammar则suffix_ids为空。
 
                     # Current ids, for cache and revert
                     cur_all_ids = tuple(req.origin_input_ids + req.output_ids)[:-1]
                     cur_output_ids = req.output_ids
 
-                    req.output_ids.extend(suffix_ids)
-                    decode_res, new_text = req.get_next_inc_detokenization()
+                    req.output_ids.extend(suffix_ids) # req.output_ids 是每个decode阶段的输出id【xgrammar忽略】
+                    decode_res, new_text = req.get_next_inc_detokenization() # 根据新增跳转部分id后的req.output_ids，去获取new_text【xgrammar忽略】
                     if not decode_res:
-                        req.output_ids = cur_output_ids
+                        req.output_ids = cur_output_ids # 获取失败则复原id【xgrammar忽略】
                         continue
 
                     (
@@ -925,6 +928,7 @@ class ScheduleBatch:
 
                     # Make the incrementally decoded text part of jump_forward_str
                     # so that the UTF-8 will not corrupt
+                    # 根据jump_str和garmmar状态, 去更新req相关标记数据。
                     jump_forward_str = new_text + jump_forward_str
                     if not req.jump_forward_and_retokenize(
                         jump_forward_str, next_state
@@ -946,7 +950,8 @@ class ScheduleBatch:
 
                     jump_forward_reqs.append(req)
                     keep_indices.remove(i)
-
+                    
+        # 根据keep_indices里没有的下标，清理self.reqs
         self.filter_batch(keep_indices=list(keep_indices))
 
         return jump_forward_reqs
@@ -995,6 +1000,8 @@ class ScheduleBatch:
             self.seq_lens.add_(1)
         self.seq_lens_sum += bs
 
+    # 将self.reqs中keep_indices对应下标元素保留，去掉其他元素；
+    # 如果keep_indices未指定，则将self.reqs中已完成或已经被chunked的去掉。
     def filter_batch(
         self,
         being_chunked_req: Optional[Req] = None,

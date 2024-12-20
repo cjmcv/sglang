@@ -415,6 +415,8 @@ async def retrieve_file_content(file_id: str):
     return await v1_retrieve_file_content(file_id)
 
 # 主进程跑TokenizerManager，另外开两个子进程分别跑Scheduler 和 DetokenizerManager。
+# 子进程可以绕开python的GIL，可充分利用多核CPU资源。
+# 而Scheduler内的模型推理任务开的是线程，虽然有GIL存在，但是GPU计算相对CPU而言是异步的，因此GIL对其性能不造成影响，而预取线程与计算线程在同一进程下，数据传递更容易且成本低。
 def launch_engine(
     server_args: ServerArgs,
 ):
@@ -452,6 +454,7 @@ def launch_engine(
         for tp_rank in tp_rank_range:
             reader, writer = mp.Pipe(duplex=False)
             gpu_id = server_args.base_gpu_id + tp_rank % tp_size_per_node
+            # 这里开的是进程
             proc = mp.Process(
                 target=run_scheduler_process,
                 args=(server_args, port_args, gpu_id, tp_rank, None, writer),
@@ -506,7 +509,7 @@ def launch_engine(
 
 # 从主入口launch_server.py 在解析了命令行参数后，得到ServerArgs，进入到这里。
 # 1. 创建http服务器，并对engine进行路由调度
-# 2. 创建SGLang运行时engine（launch_engine）
+# 2. 创建SGLang运行时engine（launch_engine），主进程运行TokenizerManager，外开两个进程运行Scheduler 和 DetokenizerManager
 #      1）TokenizerManager：将请求转为tokens（标记化）并发送给scheduler
 #      2）Scheduler：接收从TokenizerManager发送过来的请求，安排组成batches进行推理计算，并将输出的tokens发送给DetokenizerManager。
 #      3）DetokenizerManager：将输出的tokens逆标记化为人类可读的文本格式，并发送回给Tokenizer Manager。
@@ -530,7 +533,7 @@ def launch_server(
     2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
     """
     launch_engine(server_args=server_args)
-
+    print("hello>>>>>>>>>>>abc", server_args.show_time_cost)
     # Add api key authorization
     if server_args.api_key:
         add_api_key_middleware(app, server_args.api_key)

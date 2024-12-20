@@ -639,6 +639,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         )
 
 # 线性层(全连接层)，用于attention的QKV的线性变换。权重矩阵沿着输出维度拼接在一起，layer则沿着head维度并行。
+# 输出矩阵就是QKV的拼接矩阵。
 class QKVParallelLinear(ColumnParallelLinear):
     """Linear layers for the attention's QKV transformation.
 
@@ -713,6 +714,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             prefix=prefix,
         )
 
+    # 首地址是q，k的首地址是q往后偏移q的大小(self.num_heads * self.head_size), v的首地址是k往后偏移自己的大小(self.num_kv_heads * self.head_size)
     def _get_shard_offset_mapping(self, loaded_shard_id: str):
         shard_offset_mapping = {
             "q": 0,
@@ -722,6 +724,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         }
         return shard_offset_mapping.get(loaded_shard_id)
 
+    # 对于分组的attention(如GQA), num_heads会大于num_kv_heads，且是其倍数关系。其他不分组的attention，num_heads和num_kv_heads一般一致。
     def _get_shard_size_mapping(self, loaded_shard_id: str):
         shard_size_mapping = {
             "q": self.num_heads * self.head_size,
