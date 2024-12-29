@@ -281,6 +281,14 @@ def _decode_softmax_reducev_fwd(
     )
 
 
+# 以GQA为例，当group_num等于head_num时，就退化成了MHA。group是针对KV cache而言的，而head_num指的是查询头，即是q的head_num。
+# 
+# GQA中，将查询头q_head分组，同一组的q_head共享kv中的一组，kv的group_num会比q的head_num要少，以起到减少kvcache的作用。
+# 普通MHA中，q的head_num和kv的head_num一致，kv的head_num实际意义上也是group_num。每个q_head都有其对应的kv_head。
+# 普通MHA是1个q_head对应1个kv_group，GQA是几个q_head对应一个kv_group，当kv_group_num等于q_head_num时，GQA就退化成了MHA.
+# 
+# GQA的计算过程与MHA大体相同，区别点在于基于q去获取kv时，需要由q_head的下标转换为group的下标，去拿到对应group的kvcache。
+# 在extend中，分组和不分组采用同一个kernel实现，都直接传入kv_group_num进行区分即可。为什么decode要区分？TODO
 @triton.jit
 def _fwd_grouped_kernel_stage1(
     Q,
@@ -615,7 +623,7 @@ def decode_attention_fwd_normal(
     logit_cap=0.0,
 ):
     # 为什么拆分成两个kernel进行？
-    # kernel1中，采用了split-k的方式，以提高GPU使用率。所以一轮for循环只处理了k的一段，并不是k的所有数据。
+    # kernel1中，采用了split-k的方式，以提高GPU使用率(因为无法按gemm那样可以按行分block，A和C矩阵都是一行的，所以需要按列来划分)。所以一轮for循环只处理了k的一段，并不是k的所有数据。
     # 而flash attention中的分块softmax计算是基于完整的k进行的，与该kernel的for循环不相符合。
     # 因此将kernel拆分成_decode_att_m_fwd和_decode_softmax_reducev_fwd两段，前者计算Q*KT, 后者计算softmax(qkt/s)*v
 
@@ -715,7 +723,7 @@ def decode_attention_fwd(
         )
     else:
         # GQA/MQA/MLA
-        # GQA（Grouped-Query Attention）
+        # GQA（Grouped-Query Attention）- 如qwen2
         #     在传统的多头注意力（MHA）机制中，每个注意力头都有自己独立的键（Key）、值（Value）和查询（Query）。
         #     而 GQA 对其进行了改进，它将多个注意力头分组，组内的头共享相同的键和值，不同组有不同的键和值。此时Q和KV的头数量不一致。
         # MQA（Multi-Query Attention）

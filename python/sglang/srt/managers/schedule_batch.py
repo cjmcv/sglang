@@ -816,11 +816,13 @@ class ScheduleBatch:
 
         return False
 
+    # 当内存不足时，将正在decode的请求收回去，也把对应的cache都清除掉
     def retract_decode(self):
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = [i for i in range(len(self.reqs))]
 
         # TODO(lsyin): improve retraction policy for radix cache
+        # output_ids和origin_input_ids进行排序，output_ids长度从大到小降序排列，如相同时，按origin_input_ids从小到大排。
         sorted_indices.sort(
             key=lambda i: (
                 len(self.reqs[i].output_ids),
@@ -845,12 +847,13 @@ class ScheduleBatch:
                 break
 
             first_iter = False
-            idx = sorted_indices.pop()
+            idx = sorted_indices.pop() # 因是降序排列，pop出来的是列表末尾的 output_ids 长度最小的。
             req = self.reqs[idx]
             retracted_reqs.append(req)
 
             if isinstance(self.tree_cache, ChunkCache):
                 # ChunkCache does not have eviction
+                # ChunkCache没有淘汰机制
                 token_indices = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, : seq_lens_cpu[idx]
                 ]
@@ -858,6 +861,7 @@ class ScheduleBatch:
                 self.req_to_token_pool.free(req.req_pool_idx)
                 del self.tree_cache.entries[req.rid]
             else:
+                # RadixCache有淘汰机制, 将选中的req的cache都释放掉
                 # TODO: apply more fine-grained retraction
                 last_uncached_pos = len(req.prefix_indices)
                 token_indices = self.req_to_token_pool.req_to_token[
@@ -875,8 +879,8 @@ class ScheduleBatch:
                     - self.token_to_kv_pool.available_size()
                 )
                 residual_size = max(0, residual_size)
-                self.tree_cache.evict(residual_size, self.token_to_kv_pool.free)
 
+                self.tree_cache.evict(residual_size, self.token_to_kv_pool.free)
             req.prefix_indices = []
             req.last_node = None
             req.extend_input_len = 0
@@ -886,6 +890,7 @@ class ScheduleBatch:
             req.last_update_decode_tokens = 0
             req.logprob_start_len = 10**9
 
+        # 剔除batch中被sorted_indices.pop出来的部分
         self.filter_batch(keep_indices=sorted_indices)
 
         # Reqs in batch are filtered
@@ -1078,6 +1083,9 @@ class ScheduleBatch:
         self.has_stream = self.has_stream or other.has_stream
         self.has_grammar = self.has_grammar or other.has_grammar
 
+    # 区分batch里是否包含extend数据，如果是，需要提供extend相关信息。
+    # ScheduleBatch里面包含的内容太多，不便全部带走，所以单独生成ModelWorkerBatch以供内层调用。
+    # ModelWorkerBatch是个很纯粹的类，只有数据没有函数。
     def get_model_worker_batch(self):
         if self.forward_mode.is_decode() or self.forward_mode.is_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None

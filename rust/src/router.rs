@@ -22,7 +22,6 @@ pub enum Router {
     },
     CacheAware {
         /*
-            cjm_note:
             缓存感知的负载均衡路由器
             里面包含有两种策略：1. 基于近似基数树的缓存感知的数据分发（当负载均衡时使用），
                                  针对每个worker都会基于历史请求信息在路由器端为各个worker维护一个近似基数树，树里存的是原始文本而不是token id，以免频繁调用tokenization。

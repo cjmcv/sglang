@@ -37,6 +37,10 @@ def tanh(x):
     # Tanh is just a scaled sigmoid
     return 2 * tl.sigmoid(2 * x) - 1
 
+# extend kernel用于chunked prefill
+# 即包含 1）prefill(prefill分chunk后的第一个chunk)
+#       2）extend(prefill分chunk后，除了第一个以外的其他chunk；以及常规的extend)，
+#       3）穿插顺带的decode(会在间隙中捎带，是prefill与decode可以组成一个batch)
 @triton.jit
 def _fwd_kernel(
     Q_Extend,
@@ -262,7 +266,7 @@ def _fwd_kernel(
 # 主要以prefill为主，所以里面都围绕着gemm进行tl.dot的gemm进行。
 # 混合在里面的decode会以cur_seq进行区分，一个batch里不会有多个同一序列的decode数据。计算方式按prefill的方式来计算，只是q从矩阵退化成了向量。
 # 问题点: prefill是计算密集型，decode是访存密集型，prefill的q大，decode的q小，但prefill的kv可能会比decode的小，decode历史序列长，k矩阵的N可能会更大。耗时指不定谁长。
-#        且里面分配的线程资源都是一样多，如果混入超长序列的deocde在里面，是否会严重影响该kernel的结束时间(prefill部分全算完了，但decode还远没结束)？
+#        且里面分配的线程资源都是一样多，如果混入超长序列的deocde在里面(kvcache很大)，是否会严重影响该kernel的结束时间(prefill部分全算完了，但decode还远没结束)？
 def extend_attention_fwd(
     q_extend,
     k_extend,
@@ -290,8 +294,13 @@ def extend_attention_fwd(
         k_extend.shape[-1],
         v_extend.shape[-1],
     )
-
-    # TODO: 576和288是某个模型的特例？？
+    # 如GQA等分组attention，会将查询头分组，每组共享一个键和值，以减少计算量和内存使用。
+    # 在这种分组机制下，GQA 对位置信息的捕捉能力相对 MHA 可能会有所减弱，因为分组共享键值的方式在一定程度上限制了每个查询头对位置信息的独立学习和捕捉。
+    # 因此，引入 PE(Position Encoding, 位置编码) 可以帮助 GQA 更好地理解输入序列中词元的位置关系，从而更准确地计算注意力权重。
+    # 注意：MHA也可以加PE，但一般在分组attention中常见。
+    #
+    # 如果Lq是576维的，那么就有head_dim=512和pe_dim=64。也说明这里的PE是训练出来的，通过proj层得到qkv时，顺带计算出来。
+    # 同理Lq 288 = head_dim 256 + pe_dim 32。
     if Lq == 576:
         BLOCK_DMODEL = 512
         BLOCK_DPE = 64

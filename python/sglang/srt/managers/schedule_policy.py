@@ -32,7 +32,7 @@ CLIP_MAX_NEW_TOKENS_ESTIMATION = int(
     os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", "4096")
 )
 
-# 调度策略，
+# 调度策略
 class SchedulePolicy:
     def __init__(self, policy: str, tree_cache: BasePrefixCache):
         if tree_cache.disable and policy in ["lpm", "dfs-weight"]:
@@ -42,6 +42,7 @@ class SchedulePolicy:
         self.policy = policy
         self.tree_cache = tree_cache
 
+    # 按预设策略,重排waiting_queue, 并检索前缀是否已被计算
     def calc_priority(self, waiting_queue: List[Req]):
         if len(waiting_queue) > 128 and self.policy == "lpm":
             # Turn off the expensive prefix matching and sorting when the #queue is large.
@@ -122,12 +123,12 @@ class PrefillAdder:
     def __init__(
         self,
         tree_cache: BasePrefixCache,
-        running_batch: ScheduleBatch,
+        running_batch: ScheduleBatch,        # 当前输入running_batch是之前计算留下的seq，即全是decode的
         new_token_ratio: float,
         rem_total_tokens: int,
         rem_input_tokens: int,
         rem_chunk_tokens: Optional[int],
-        mixed_with_decode_tokens: int = 0,
+        mixed_with_decode_tokens: int = 0,   # chunked prefill中一个chunk顺带的deocde数量
     ):
         self.tree_cache = tree_cache
         self.running_batch = running_batch

@@ -59,8 +59,10 @@ class XGrammarGrammar(BaseGrammarObject):
         self.vocab_size = vocab_size
         self.ctx = ctx # CompiledGrammar可用于GrammarMatcher，以便高效地生成token掩码
 
+    # 接收一个token，并更新matcher的状态，接收的token是prefill和decode后确定的token。
+    # 而grammar对decode的约束是在BaseGrammarBackend.get_future_value中，在准备用于推理的batch时，根据当前状态添加进去的？？？TODO
     def accept_token(self, token: int):
-        assert self.matcher.accept_token(token) # 接收一个token，并更新matcher的状态
+        assert self.matcher.accept_token(token) 
 
     def try_jump_forward(self, tokenizer) -> Tuple[List[int], str]:
         # 查找用于jump-forward decoding的jump-forward符串。

@@ -142,6 +142,8 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
     ) -> None:
         super().__init__(base_layer, segment_gemm, lora_rank, scaling)
 
+    # 该函数会在ForwardBatch.init_new->prepare_lora_batch中被调用，即每次推理前都会调用一次，以更新当前batch数据对应的lora信息
+    # 信息重点是bs，seg_indptr 和 weight_indices。
     def set_lora_info(
         self, A_buffer_qkv, B_buffer_q, B_buffer_kv, bs, seg_indptr, weight_indices
     ):
@@ -153,7 +155,20 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         self.seg_indptr = seg_indptr
         self.weight_indices = weight_indices
 
+    # apply_lora会在每次调用该层的forward时调用。
+    # lora的计算公式：无lora Y=X*W, 有lora Y=X*(W+AB)
+    # 可以分成两种方式计算：
+    # 1. 事先将lora的AB矩阵合入到原来矩阵权重中，得到新的W1=W0+A*B，Y=X*W1
+    # 2. 不保留修改后的权重，原来权重的计算照旧，即Y=X*W0 + X*A*B
+    # 这里采用的是第二种方式，原因在于可以随着batch的数据，动态切换各种各样的lora模块，lora模块会跟batch里的每个seq一一对应。
+    # (TokenizerManager) -> generate_request -> _tokenize_one_request -> (Scheduler) -> recv_from_tokenizer -> TokenizedGenerateReqInput
+    #  -> recv_req.lora_path -> ModelWorkerBatch(python/sglang/srt/managers/schedule_batch.py#1106) -> ForwardBatch.lora_paths
+    # 从最初的generate_request就已经有指定lora_path了。每个req对应一个lora_path，但是基础模型都共用一个，所以不采用动态执行而不保存修改后的权重。
+    #
+    # apply_lora函数里，base_output是基础模型的计算输出，即上面的X*W0, 是已经算好了的。
+    # apply_lora函数需要计算X*A*B，然后与X*W0相加得到lora的叠加输出。
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        # 计算X*A
         lora_a_output = self.segment_gemm.run(
             x=x,
             weights=self.A_buffer_qkv,
@@ -162,6 +177,7 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             seg_indptr=self.seg_indptr,
             weight_indices=self.weight_indices,
         )
+        # 计算X*B, 这里q和kv分开两个segment_gemm进行。
         # FIXME parallelize qkv
         lora_output = torch.empty_like(base_output)
         # q
@@ -175,7 +191,7 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             weight_indices=self.weight_indices,
         )
         # kv
-        output_dim_kv = self.B_buffer_kv.shape[-2] // 2
+        output_dim_kv = self.B_buffer_kv.shape[-2] // 2 # 向下取整除法
         for i in range(2):
             left = output_dim_kv * i
             right = left + output_dim_kv
@@ -265,6 +281,11 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
 def get_lora_layer(
     layer: nn.Module, segment_gemm, lora_rank, scaling
 ) -> BaseLayerWithLoRA:
+    # 下面是lora支持的层，左边是并入lora前的(即原始模型定义的)，右边是并入lora后的。
+    # 函数输入的layer就是原始模型定义层，通过这个层，看能否找到对应的lora层，
+    # 找到则构造一个对应lora层对象，并返回。如果找不到则不支持。
+    # note: 都带有Parallel字样，因为这些层都考虑了张量并行，会按rank进行权重的加载和计算。
+    #       lora的AB矩阵也要随之加载和分块计算。因为lora权重少，直接全量加载，计算时分块即可？
     supported_layer_types = {
         # the order matters
         VocabParallelEmbedding: VocabParallelEmbeddingWithLoRA,

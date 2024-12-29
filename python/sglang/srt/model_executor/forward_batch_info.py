@@ -218,6 +218,7 @@ class ForwardBatch:
         self.mrope_positions = self.mrope_positions.to(torch.int64)
 
     # 用@classmethod修饰，cls指向类本身，即可通过类名直接访问该函数进行类对象的构建。
+    # 
     @classmethod
     def init_new(
         cls,
@@ -260,6 +261,9 @@ class ForwardBatch:
         if ret.forward_mode.is_idle():
             return ret
 
+        # 如果batch里全是decode数据，则不需要位置信息，因为位置就是下一位。
+        # 如果不都是decode，则需要按extend来看，extend是在某段完成后，退出的batch，然后再重新从waiting_queue中以新seq来加入batch的数据，需要提供extend的片段处于原始seq中的位置。
+        # 如果是全新seq的prefill，也会用到前缀数据，拼接前缀后也需要填充位置信息。且按chunked prefill来计算，prefill分段后也就变成了一个小段prefill+多个小段extend了。
         # Init position information
         if not ret.forward_mode.is_decode():
             ret.extend_seq_lens = torch.tensor(

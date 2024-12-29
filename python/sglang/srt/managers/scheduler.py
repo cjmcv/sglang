@@ -158,6 +158,12 @@ class Scheduler:
         )
         self.is_generation = self.model_config.is_generation
 
+        # 在TokenizerManager/DetokenizerManager和TpModelWorker的初始化里也有这个操作
+        # 为什么多处地方都有这样的操作
+        # -- Scheduler 中的需要用语法限制decode输出，需要用到tokenizer
+        # -- TokenizerManager 需要用tokenizer来转化请求，送给Scheduler
+        # -- DetokenizerManager 同TokenizerManager，也需要用tokenizer来逆转换。
+        # -- TpModelWorker？TODO: 为什么也需要tokenizer？
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:
@@ -267,9 +273,9 @@ class Scheduler:
         # The running decoding batch for continuous batching
         # 连续批处理, 可在处理一个批次的请求时，动态地添加新的请求到批次中，而不必等待整个批次完成处理。
         # 即running_batch在有数据需要处理时，会一直存在，动态更新添加新请求，并一直被计算。
-        # 每次循环中从get_next_batch_to_run添加新请求，更新并进入run_batch计算的都是这个running_batch。
+        # 每次循环中调用get_next_batch_to_run，保留上一轮batch中还需要继续计算的部分，从waiting_queue中获取新请求进行补充，更新到running_batch并进入run_batch。
 
-        # running_batch里存放的都是用于decode的数据。
+        # running_batch里存放的有新加入的extend或之前做了extend需要继续做decode的数据。
         # waiting_queue里的都是全新的prefill数据或需要extend的数据。
         # 
         self.running_batch: Optional[ScheduleBatch] = None
@@ -426,10 +432,9 @@ class Scheduler:
         # Scheduler会一直循环从zmq接收来自TokenizerManager发送过来的请求，
         # 安排组成batches进行推理计算，并将输出的tokens发送给DetokenizerManager。
         while True:
-            recv_reqs = self.recv_requests()   # zmq接收请求
+            recv_reqs = self.recv_requests()   # rank0通过zmq接收请求，并广播给其他tp_rank，同一组的tp_rank会有相同的数据。
             self.process_input_requests(recv_reqs) # 根据请求指令做相关处理，该请求指令
 
-            # 1. 如果存在上一个batc
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             if batch:
