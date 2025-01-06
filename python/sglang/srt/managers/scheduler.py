@@ -376,6 +376,7 @@ class Scheduler:
 
         # Init metrics stats
         self.stats = SchedulerStats()
+        print("abcabcabc>>>>>>>", self.enable_metrics)
         if self.enable_metrics:
             self.metrics_collector = SchedulerMetricsCollector(
                 labels={
@@ -679,7 +680,7 @@ class Scheduler:
         # Init grammar cache for this request
         add_to_grammar_queue = False
         if (
-            # 需要是json或正则表达式才用
+            # 需要是json或正则表达式才用, 从sampling_params中获取
             req.sampling_params.json_schema is not None
             or req.sampling_params.regex is not None
         ):
@@ -688,7 +689,8 @@ class Scheduler:
                 key = ("json", req.sampling_params.json_schema)
             elif req.sampling_params.regex is not None:
                 key = ("regex", req.sampling_params.regex)
-
+            
+            # print("grammar_backend: ", self.grammar_backend)
             req.grammar = self.grammar_backend.get_cached_value(key)
             if not req.grammar:
                 req.grammar = self.grammar_backend.get_future_value(key)
