@@ -3,8 +3,11 @@ from pydantic import BaseModel
 import json
 from typing import List
 
+# client = openai.Client(
+#     base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
 client = openai.Client(
-    base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
+    base_url="http://127.0.0.1:8000/v1/", api_key="EMPTY")
+
 
 # # Text completion
 # response = client.completions.create(

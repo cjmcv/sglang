@@ -204,14 +204,6 @@ def get_dataset(args, tokenizer):
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
     return input_requests
 
-
-ASYNC_REQUEST_FUNCS = {
-    "sglang": async_request_openai_completions,
-    "vllm": async_request_openai_completions,
-    "lmdeploy": async_request_openai_completions,
-}
-
-
 @dataclass
 class BenchmarkMetrics:
     completed: int
@@ -423,6 +415,11 @@ def gen_prompt(tokenizer, token_num):
     selected_tokens = random.choices(all_available_tokens, k=token_num)
     return tokenizer.decode(selected_tokens)
 
+# async def定义的异步函数, input_requests 包含本轮测试的所有请求数据.
+# 里面用到了 yield, 所以 get_request 是生成器函数.
+# 第一次进入get_request函数, 会进入到for循环里, 从input_requests里取出第一个request, 然后在yield中返回出去给外部使用.
+# 在外部再次调用 get_request 函数时, 会直接回到yield处继续执行, 会进入到await asyncio.sleep(interval)中sleep一段时间, 以控制请求发送的速度.
+# sleep后for循环迭代下一次, 拿出下一个request, 再通过yield返回, 如此一直循环, 直到 for request in input_requests 的内容全部被取出.
 async def get_request(
     input_requests: List[Tuple[str, int, int]],
     request_rate: float,
@@ -530,20 +527,19 @@ async def benchmark(
     extra_request_body: Dict[str, Any],
     profile: bool,
 ):
-    if backend in ASYNC_REQUEST_FUNCS:
-        request_func = ASYNC_REQUEST_FUNCS[backend]
-    else:
-        raise ValueError(f"Unknown backend: {backend}")
 
     # From https://github.com/vllm-project/vllm/pull/9390
+    # 使用信号量来控制最大并发数
     semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
-
+    # 如果没有 semaphore, 则并发数不做限制, 每个任务直接进入request_func计算, 并等待其计算完成.
+    # 如果由 semaphore, semaphore会指定最大并发数, 用async with semaphore 启用, 各个任务进入到这里, 会根据semaphore来控制当前时刻是否能进入到request_func,实现有序进入,避免超负载.
     async def limited_request_func(request_func_input, pbar):
         if semaphore is None:
-            return await request_func(request_func_input=request_func_input, pbar=pbar)
+            return await async_request_openai_completions(request_func_input=request_func_input, pbar=pbar)
         async with semaphore:
-            return await request_func(request_func_input=request_func_input, pbar=pbar)
+            return await async_request_openai_completions(request_func_input=request_func_input, pbar=pbar)
 
+    # 拿出第一个request进行预热和验证.
     print("Starting initial single prompt test run...")
     test_prompt, test_prompt_len, test_output_len = input_requests[0]
     test_input = RequestFuncInput(
@@ -554,7 +550,7 @@ async def benchmark(
         output_len=test_output_len,
         extra_request_body=extra_request_body,
     )
-    test_output = await request_func(request_func_input=test_input)
+    test_output = await async_request_openai_completions(request_func_input=test_input)
     if not test_output.success:
         raise ValueError(
             "Initial test run failed - Please make sure benchmark arguments "
@@ -577,8 +573,11 @@ async def benchmark(
 
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
+    # async for 表示 get_request 是一个异步可迭代对象, 使用async def定义的, 每次调用获取一个request.
+    # input_requests是整个数据集里所有的请求, 处理完则任务结束.
     async for request in get_request(input_requests, request_rate):
         prompt, prompt_len, output_len = request
+        # 打包request
         request_func_input = RequestFuncInput(
             model=model_id,
             prompt=prompt,
@@ -587,11 +586,14 @@ async def benchmark(
             output_len=output_len,
             extra_request_body=extra_request_body,
         )
+        # 使用打包的request, 创建异步任务,并加入到列表中.
+        # 异步任务是limited_request_func, 
         tasks.append(
             asyncio.create_task(
                 limited_request_func(request_func_input=request_func_input, pbar=pbar)
             )
         )
+    # asyncio.gather(*tasks)是等待所有task都完成.
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
 
     if profile:
@@ -769,7 +771,7 @@ def check_chat_template(model_path):
         return False
 
 
-def run_benchmark(args_: argparse.Namespace):
+def run_api_benchmark(args_: argparse.Namespace):
     global args
     args = args_
 
@@ -809,7 +811,8 @@ def run_benchmark(args_: argparse.Namespace):
     base_url = (
         f"http://{args.host}:{args.port}" if args.base_url is None else args.base_url
     )
-
+    print("model_url: ", model_url)
+    print("base_url: ", base_url)
     # Get model name
     if args.model is None:
         try:
@@ -839,48 +842,26 @@ def run_benchmark(args_: argparse.Namespace):
     backend = args.backend
     model_id = args.model
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
-
     tokenizer = get_tokenizer(tokenizer_id)
 
     input_requests = get_dataset(args, tokenizer)
+    print("Finish preparing dataset.")
 
-    if not args.multi:
-        return asyncio.run(
-            benchmark(
-                backend=backend,
-                api_url=api_url,
-                base_url=base_url,
-                model_id=model_id,
-                tokenizer=tokenizer,
-                input_requests=input_requests,
-                request_rate=args.request_rate,
-                max_concurrency=args.max_concurrency,
-                disable_tqdm=args.disable_tqdm,
-                extra_request_body=extra_request_body,
-                profile=args.profile,
-            )
+    return asyncio.run(
+        benchmark(
+            backend=backend,
+            api_url=api_url,
+            base_url=base_url,
+            model_id=model_id,
+            tokenizer=tokenizer,
+            input_requests=input_requests,
+            request_rate=args.request_rate,
+            max_concurrency=args.max_concurrency,
+            disable_tqdm=args.disable_tqdm,
+            extra_request_body=extra_request_body,
+            profile=args.profile,
         )
-    else:
-        # Benchmark multiple rps. TODO: use a fixed duration to compute num_prompts
-        request_rates = parse_request_rate_range(args.request_rate_range)
-
-        for rate in request_rates:
-            asyncio.run(
-                benchmark(
-                    backend=backend,
-                    api_url=api_url,
-                    base_url=base_url,
-                    model_id=model_id,
-                    tokenizer=tokenizer,
-                    input_requests=input_requests,
-                    request_rate=rate,
-                    max_concurrency=args.max_concurrency,
-                    disable_tqdm=args.disable_tqdm,
-                    extra_request_body=extra_request_body,
-                    profile=args.profile,
-                )
-            )
-
+    )
 
 def set_ulimit(target_soft_limit=65535):
     resource_type = resource.RLIMIT_NOFILE
@@ -898,7 +879,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--backend",
         type=str,
-        choices=list(ASYNC_REQUEST_FUNCS.keys()),
+        choices=["sglang", "vllm", "lmdeploy"],
         default="sglang",
         help="Must specify a backend, depending on the LLM Inference Engine.",
     )
@@ -909,7 +890,7 @@ if __name__ == "__main__":
         help="Server or API base url if not using http host and port.",
     )
     parser.add_argument(
-        "--host", type=str, default="0.0.0.0", help="Default host is 0.0.0.0."
+        "--host", type=str, default="127.0.0.1", help="Default host is 127.0.0.1."
     )
     parser.add_argument(
         "--port",
@@ -1029,4 +1010,4 @@ if __name__ == "__main__":
         "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
     )
     args = parser.parse_args()
-    run_benchmark(args)
+    run_api_benchmark(args)

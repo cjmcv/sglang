@@ -26,6 +26,9 @@
 # 2）如果某个seq能找到可jump的部分，将该seq当作已完成的seq，留存对应cache到基数树上，并将其从计算batch中移除出去，重新放回到waiting_queue。
 # 3）在下一轮读取时，从wait_queue中重新把这个seq取出来放回到计算batch中，按新的extend请求来处理。
 
+# 注意 grammar后端(outlines/xgrammar)是初始化的时候指定的，但grammar实例是与seq一一绑定，因此需要在输入seq时指定模板才会起效，而jump-forward是在grammar里的，因此也只针对用户提供的模板。
+# grammar使用方式：client.chat.completions.create 中指定 response_format。
+
 import logging
 from typing import List, Tuple
 
