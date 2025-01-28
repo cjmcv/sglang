@@ -36,13 +36,19 @@ logger.warning(
     "The following error message 'operation scheduled before its operands' can be ignored."
 )
 
-
+# tanh的公式是(e^x - e^-x) / (e^x + e^-x)
+# sigmoid的公式是 1/ (1 + e^-x)
+# 可以换算由sigmoid得到tanh
 @triton.jit
 def tanh(x):
     # Tanh is just a scaled sigmoid
     return 2 * tl.sigmoid(2 * x) - 1
 
-
+# 因果mask仅在prefill和extend阶段需要额外加，而在decode阶段不需要。
+# 看图：https://flashinfer.ai/2024/02/02/introduce-flashinfer.html https://zhuanlan.zhihu.com/p/681506469 
+# 因为prefill时，输入“今天天气很好”，则对于“气”字需要和前面的“今天天”以及自己的“气”做计算，后面的“很好”属于未来数据，不应被看见。
+# extend部分同理，但会区分历史部分，和当前新增部分，历史部分需要全部参与计算，当前新增部分与prefill一致。
+# decode时，则新增的部分即只有一个token，自己就是最新的数据，需要与所有历史数据计算，没有三角区域的限制。
 @triton.jit
 def _fwd_kernel_stage1(
     Q,
@@ -72,6 +78,10 @@ def _fwd_kernel_stage1(
     Lk: tl.constexpr,
     Lv: tl.constexpr,
 ):
+    # 在extend中，一个线程block会取到q的多行，因为这几行有可能会是同一个序列的，需要做gemm。
+    # 而这里的decode，一个block的线程只会取到q的一行去做gemv，因为每一行都属于不同的序列，都有各自的kv，需要各自去计算gemv。
+    # decode组batch进kernel，虽然仍是对每行做gemv，但也能提高吞吐量。因为q太小，难以充分利用所有sm。组成batch后，可以一个block负责一行q，sm能够得到充分利用。
+    # 进一步，如果使用一个block负责一整行q的计算，计算量太大时间太长，且batch还是比较小，sm无法全部分配上，则可以采用split-k的方式，用多个block来负责一行q。
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
     split_kv_id = tl.program_id(2)
@@ -230,6 +240,14 @@ def _decode_att_m_fwd(
     )
 
 
+# 以GQA为例，当group_num等于head_num时，就退化成了MHA。group是针对KV cache而言的，而head_num指的是查询头，即是q的head_num。
+# 
+# GQA中，将查询头q_head分组，同一组的q_head共享kv中的一组，kv的group_num会比q的head_num要少，以起到减少kvcache的作用。
+# 普通MHA中，q的head_num和kv的head_num一致，kv的head_num实际意义上也是group_num。每个q_head都有其对应的kv_head。
+# 普通MHA是1个q_head对应1个kv_group，GQA是几个q_head对应一个kv_group，当kv_group_num等于q_head_num时，GQA就退化成了MHA.
+# 
+# GQA的计算过程与MHA大体相同，区别点在于基于q去获取kv时，需要由q_head的下标转换为group的下标，去拿到对应group的kvcache。
+# 在extend中，分组和不分组采用同一个kernel实现，都直接传入kv_group_num进行区分即可。为什么decode要区分？TODO
 @triton.jit
 def _fwd_grouped_kernel_stage1(
     Q,
@@ -582,6 +600,12 @@ def decode_attention_fwd_normal(
     sm_scale,
     logit_cap=0.0,
 ):
+    # 为什么拆分成两个kernel进行？
+    # kernel1中，采用了split-k的方式，以提高GPU使用率(因为无法按gemm那样可以按行分block，A和C矩阵都是一行的，所以需要按列来划分)。所以一轮for循环只处理了k的一段，并不是k的所有数据。
+    # 而flash attention中的分块softmax计算是基于完整的k进行的，与该kernel的for循环不相符合。
+    # 因此将kernel拆分成_decode_att_m_fwd和_decode_softmax_reducev_fwd两段，前者计算Q*KT, 后者计算softmax(qkt/s)*v
+
+    # 计算Q*KT
     _decode_att_m_fwd(
         q,
         k_buffer,
@@ -594,6 +618,7 @@ def decode_attention_fwd_normal(
         sm_scale,
         logit_cap,
     )
+    # 计算 分块softmax(qkt/s)*v
     _decode_softmax_reducev_fwd(attn_logits, q, o, v_buffer, b_seq_len, num_kv_splits)
 
 
@@ -658,6 +683,15 @@ def decode_attention_fwd(
         )
     else:
         # GQA/MQA/MLA
+        # GQA（Grouped-Query Attention）- 如qwen2
+        #     在传统的多头注意力（MHA）机制中，每个注意力头都有自己独立的键（Key）、值（Value）和查询（Query）。
+        #     而 GQA 对其进行了改进，它将多个注意力头分组，组内的头共享相同的键和值，不同组有不同的键和值。此时Q和KV的头数量不一致。
+        # MQA（Multi-Query Attention）
+        #     一种更激进的注意力机制优化策略。在 MQA 中，所有的注意力头都共享相同的键和值，只有查询是每个头独立的。
+        # MLA（Multi-head Latent Attention）
+        #     DeepSeek-V2 所使用的一种注意力机制，在多头注意力的基础上引入潜在的表示，来更好地捕捉输入信息中的潜在特征. 如通过低秩投影压缩 KV Cache 的大小，以达到比 GQA 更省内存且效果更好的目的.
+        #     针对多卡并行，一个关键的特性是MLA只有一个KV head，无法按头拆分到各个GPU上，所以在张量并行计算中，会存在KV缓存的重复计算和显存浪费的问题。
+        #     MLA的多卡并行加速，在sglang里是采用数据并行的方式进行，每个GPU都会有一个模型备份，各自数据单独计算。
         decode_attention_fwd_grouped(
             q,
             k_buffer,

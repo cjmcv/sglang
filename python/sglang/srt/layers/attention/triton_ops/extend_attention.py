@@ -37,7 +37,10 @@ def tanh(x):
     # Tanh is just a scaled sigmoid
     return 2 * tl.sigmoid(2 * x) - 1
 
-
+# extend kernel用于chunked prefill
+# 即包含 1）prefill(prefill分chunk后的第一个chunk)
+#       2）extend(prefill分chunk后，除了第一个以外的其他chunk；以及常规的extend)，
+#       3）穿插顺带的decode(会在间隙中捎带，是prefill与decode可以组成一个batch)
 @triton.jit
 def _fwd_kernel(
     Q_Extend,
@@ -74,28 +77,29 @@ def _fwd_kernel(
     BLOCK_DV: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-):
-    cur_seq = tl.program_id(0)
-    cur_head = tl.program_id(1)
-    cur_block_m = tl.program_id(2)
+): 
+    cur_seq = tl.program_id(0)      # 行索引，0号以该batch里序列数量划分，即一个block对应一个序列。q的一行或者多行会对应bacth里的一个序列。
+    cur_head = tl.program_id(1)     # 列索引
+    cur_block_m = tl.program_id(2)  # 行索引
     cur_kv_head = cur_head // kv_group_num
 
-    cur_seq_len = tl.load(B_Seq_Len + cur_seq)
-    cur_seq_len_extend = tl.load(B_Seq_Len_Extend + cur_seq)
-    cur_seq_len_prefix = cur_seq_len - cur_seq_len_extend
+    cur_seq_len = tl.load(B_Seq_Len + cur_seq)  # B_Seq_Len 是一个列表，长度与序列数量一致，序列下标即是列表元素下标，标记该batch下每个序列的长度。
+    cur_seq_len_extend = tl.load(B_Seq_Len_Extend + cur_seq) # B_Seq_Len_Extend 与上面的类似。
+    cur_seq_len_prefix = cur_seq_len - cur_seq_len_extend    # 序列长度 = prefix前缀长度 + extend扩展长度
 
     cur_seq_prefix_start_in_loc = 0
-    cur_seq_extend_start_contiguous = tl.load(B_Start_Loc_Extend + cur_seq)
+    cur_seq_extend_start_contiguous = tl.load(B_Start_Loc_Extend + cur_seq) # extend的起始点，包括q_extend，k_extend和v_extend。
     cur_batch_req_idx = tl.load(B_req_idx + cur_seq)
 
-    offs_d = tl.arange(0, BLOCK_DMODEL)
-    offs_dv = tl.arange(0, BLOCK_DV)
+    offs_d = tl.arange(0, BLOCK_DMODEL) # q的head_dim
+    offs_dv = tl.arange(0, BLOCK_DV)    # v的head_dim
     offs_m = tl.arange(0, BLOCK_M)
     mask_m = (cur_block_m * BLOCK_M + offs_m) < cur_seq_len_extend
 
     mask_d = offs_d < Lq
     mask_dv = offs_dv < Lv
 
+    # （extend的数据起始点+线程划分的行范围）* 总列数 + 列方向head_id*head_dim + 线程划分的列范围，得到extend的q_tile
     offs_q = (
         (cur_seq_extend_start_contiguous + cur_block_m * BLOCK_M + offs_m[:, None])
         * stride_qbs
@@ -106,6 +110,7 @@ def _fwd_kernel(
         Q_Extend + offs_q, mask=(mask_m[:, None]) & (mask_d[None, :]), other=0.0
     )
 
+    # 除了Lq为576或288, 其他情况下均为0.
     if BLOCK_DPE > 0:
         offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
         offs_qpe = (
@@ -123,9 +128,13 @@ def _fwd_kernel(
     deno = tl.zeros([BLOCK_M], dtype=tl.float32)
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
+    # K(n,k) 矩阵上，在n方向上从0到前缀长度范围，取k_tile, 逐个与q_tile做gemm。取k_tile时，按转置的索引取，完成QxKT计算。进行进行分块softmax和gemm v.
     for start_n in range(0, cur_seq_len_prefix, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_seq_len_prefix
+        # cur_batch_req_idx：当前req在该batch下的行偏移量； stride_req_to_tokens_b: 一行的总列数？
+        # Req_to_tokens存放由req定位到tokens的索引，start_n + offs_n: 线程所负责的范围
+        # 得到offs_b_loc_prefix是prefix的偏移量。进而基于该偏移量在Req_to_tokens中找到对应prefix在k_buffer中存放的位置。
         offs_b_loc_prefix = cur_batch_req_idx * stride_req_to_tokens_b + (
             cur_seq_prefix_start_in_loc + start_n + offs_n
         )
@@ -179,8 +188,10 @@ def _fwd_kernel(
 
         e_max = n_e_max
 
+    # 上面计算的是前缀部分，全部都属于历史数据，因此需要全计算。
+    # 而这里需要计算KV的扩展部分，这部分KV中会与Q的各个token在时序上有前后重叠关系。而因果模型中，需要屏蔽未来的数据，则只需要计算三角区域即可。、
+    # n的范围从
     # stage 2: compute the trianlge part
-
     cur_block_m_end = tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
     for start_n in range(0, cur_block_m_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
@@ -216,6 +227,7 @@ def _fwd_kernel(
         if logit_cap > 0:
             qk = logit_cap * tanh(qk / logit_cap)
 
+        # 针对因果模型，用于屏蔽三角区域的mask
         mask_causual = (cur_block_m * BLOCK_M + offs_m[:, None]) >= (
             start_n + offs_n[None, :]
         )
@@ -250,7 +262,11 @@ def _fwd_kernel(
         O_Extend + offs_o, acc / deno[:, None], mask=mask_m[:, None] & mask_dv[None, :]
     )
 
-
+# 负责chuncked prefill或 prefill与decode混合的数据。
+# 主要以prefill为主，所以里面都围绕着gemm进行tl.dot的gemm进行。
+# 混合在里面的decode会以cur_seq进行区分，一个batch里不会有多个同一序列的decode数据。计算方式按prefill的方式来计算，只是q从矩阵退化成了向量。
+# 问题点: prefill是计算密集型，decode是访存密集型，prefill的q大，decode的q小，但prefill的kv可能会比decode的小，decode历史序列长，k矩阵的N可能会更大。耗时指不定谁长。
+#        且里面分配的线程资源都是一样多，如果混入超长序列的deocde在里面(kvcache很大)，是否会严重影响该kernel的结束时间(prefill部分全算完了，但decode还远没结束)？
 def extend_attention_fwd(
     q_extend,
     k_extend,
@@ -272,12 +288,19 @@ def extend_attention_fwd(
 
     k_buffer, v_buffer: (prefix + extend) tensors in mem_manager
     """
+    # 最后一维都是每个头的特征长度 head_dim
     Lq, Lk, Lv = (
         q_extend.shape[-1],
         k_extend.shape[-1],
         v_extend.shape[-1],
     )
-
+    # 如GQA等分组attention，会将查询头分组，每组共享一个键和值，以减少计算量和内存使用。
+    # 在这种分组机制下，GQA 对位置信息的捕捉能力相对 MHA 可能会有所减弱，因为分组共享键值的方式在一定程度上限制了每个查询头对位置信息的独立学习和捕捉。
+    # 因此，引入 PE(Position Encoding, 位置编码) 可以帮助 GQA 更好地理解输入序列中词元的位置关系，从而更准确地计算注意力权重。
+    # 注意：MHA也可以加PE，但一般在分组attention中常见。
+    #
+    # 如果Lq是576维的，那么就有head_dim=512和pe_dim=64。也说明这里的PE是训练出来的，通过proj层得到qkv时，顺带计算出来。
+    # 同理Lq 288 = head_dim 256 + pe_dim 32。
     if Lq == 576:
         BLOCK_DMODEL = 512
         BLOCK_DPE = 64
@@ -315,6 +338,7 @@ def extend_attention_fwd(
         num_warps = 4 if Lk <= 64 else 8
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
+    # batch_size是序列的数量，会比q矩阵的行要少，q的一行或者多行会对应bacth里的一个序列，而grid按batch_size划分，意味着序列长和序列短的数据都会分配相同数量的线程？
     batch_size, head_num = b_seq_len.shape[0], q_extend.shape[1]
     kv_group_num = q_extend.shape[1] // k_extend.shape[1]
 
@@ -326,19 +350,19 @@ def extend_attention_fwd(
         extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
 
     _fwd_kernel[grid](
-        q_extend,
-        k_extend,
-        v_extend,
+        q_extend,      
+        k_extend,       # extend部分，只计算三角区域
+        v_extend,       # extend部分，只计算三角区域
         o_extend,
-        k_buffer,
-        v_buffer,
-        req_to_tokens,
-        b_req_idx,
-        b_seq_len,
-        b_start_loc_extend,
-        b_seq_len_extend,
-        sm_scale,
-        kv_group_num,
+        k_buffer,       # q_extend与k_buffer里prefix部分全计算
+        v_buffer,       #         与v_buffer里prefix部分全计算
+        req_to_tokens,  # 2) 拿着req_idx去Req_to_tokens里找到prefix的下标，进而在K_Buffer中去除prefix对应的k cache，与q_extend计算
+        b_req_idx,      # 1）通过B_req_idx找到req的下标 req_idx
+        b_seq_len,      # 一个列表，长度与该batch的序列数量一致，序列下标即是列表元素的下标，标记着该batch下每个序列的长度。
+        b_start_loc_extend, # extend的起始点，包括q_extend，k_extend和v_extend的起始点
+        b_seq_len_extend,   # 与 b_seq_len 类似，也是一个列表，但对应的是extend的长度，seq_len = prefix_len + seq_len_extend
+        sm_scale,           # Q x KT下面的缩放因子分母，可以保持方差稳定，因为QKT可以看作是dk个元素乘积，不缩放的话，dk越大，方差越大。缩放后可保持softmax的输入大小在合理范围内。(方差越大，表明数据越离散，softmax输出容易出现极端情况)
+        kv_group_num,       # 分组数量，如GQA中，q的head会比kv的head要多，分组数量=q_head/kv_head.
         q_extend.stride(0),
         q_extend.stride(1),
         k_extend.stride(0),

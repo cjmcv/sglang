@@ -57,7 +57,13 @@ def _to_torch(model: torch.nn.Module, reverse: bool, batch_size: int):
         if isinstance(sub, torch.nn.Module):
             _to_torch(sub, reverse, batch_size)
 
-
+# @contextmanager 是装饰符，用于简化上下文管理，它能够在进入和离开with语句块时自动执行一些代码。
+# 例如，文件操作中，我们经常使用with语句来确保文件在使用后能正确关闭，这就是利用了文件对象的上下文管理器功能。
+# 
+# patch_model是根据是否需要做torch.compile, 而做了一层适配的中转，返回推理函数。
+# torch.compile会把model.forward的内容固化成静态graph，会采用采用算子融合、内存布局优化等策略，提高计算效率。
+# cuda graph是把cuda操作固化，如kernel launch和copy等，通过捕获（capture）一系列操作来减少启动开销。
+# 二者不冲突，可一起使用。cuda graph可以使用torch.compile前或compile后的计算过程。
 @contextmanager
 def patch_model(
     model: torch.nn.Module,
@@ -141,14 +147,18 @@ class CudaGraphRunner:
                     )
                 )
             )
-
+        # 过滤掉预设数据里超过范围的部分
         self.capture_bs = [
             bs
             for bs in self.capture_bs
             if bs <= model_runner.req_to_token_pool.size
             and bs <= model_runner.server_args.cuda_graph_max_bs
         ]
-
+        # 使用torch.compile的话，需要先对forward做了compile后提供给cuda graph。否则直接原始的forward函数即可。
+        # torch.compile和cuda graph针对的优化点不同，二者可一起使用，共同优化。
+        # torch.compile默认都使用, 除非超出数据量范围限制torch_compile_max_bs（可能是防止内存过大？）
+        # 按bs来划分的目的是因为二者的优化都和输入数据量有关，数据量不一致，优化的结果也不一致。
+        # 因为优化的初始化时离线进行的，后续不更改，所以按一个bs一份graph的方式进行。
         self.compile_bs = (
             [
                 bs
@@ -185,6 +195,8 @@ class CudaGraphRunner:
         if self.use_torch_compile:
             set_torch_compile_config()
 
+        # graph的输入输出数据内存，用于cuda graph的capture时会与计算流程绑定在一起，计算时用的就是这些buffer的内存数据。
+        # 内存按最大batch_size来开辟，实际使用时会按特定batch_size去取。
         # Common inputs
         with torch.device("cuda"):
             self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
@@ -264,6 +276,8 @@ class CudaGraphRunner:
         # NOTE: cuda graph cannot handle mixed batch (encoder_len = 0)
         # If mixed batch cannot be supported, then encoder_lens can be removed in cuda graph
         # because the full_text_row_masked_out_mask tensor will always be ones
+        # 如果是decode_only是支持的，但如果是encoder_decoder模型，则需要forward_batch.encoder_lens里的元素全部都大于0才行。
+        # 因为cuda graph无法处理mixed batch的情况？TODO why
         is_encoder_lens_supported = (
             torch.all(forward_batch.encoder_lens > 0)
             if self.is_encoder_decoder
@@ -296,6 +310,8 @@ class CudaGraphRunner:
                 # Save gemlite cache after each capture
                 save_gemlite_cache()
 
+    # 基于一个batch_size去构建一个cuda graph。
+    # 因为 CUDA Graph 是基于固定的操作序列构建的，所以输入数据的形状和类型最好是相对固定的，所以会以batch_size划分。
     def capture_one_batch_size(self, bs: int, forward: Callable):
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
@@ -357,7 +373,8 @@ class CudaGraphRunner:
             forward_batch.forward_mode,
             forward_batch.spec_info,
         )
-
+ 
+        # 使用虚拟输入数据，结合特定batch_size，构架一个ForwardBatch，并跑一遍模型，得到输出。
         # Run and capture
         def run_once():
             logits_output = forward(input_ids, forward_batch.positions, forward_batch)
@@ -375,13 +392,16 @@ class CudaGraphRunner:
         torch.cuda.synchronize()
         self.model_runner.tp_group.barrier()
 
+        # torch.cuda.graph是一个上下文管理器（context-manager），
+        # 它能够将 CUDA 相关的操作捕获到一个 CUDAGraph 类的对象当中，以便后续进行 replay 操作。
+        # 这里表示捕获的是 out = run_once() 这个过程，后面调用replay时，相当于再次执行 out = run_once()。
         with torch.cuda.graph(graph, pool=self.graph_memory_pool, stream=stream):
             out = run_once()
 
         torch.cuda.synchronize()
         self.model_runner.tp_group.barrier()
 
-        self.graph_memory_pool = graph.pool()
+        self.graph_memory_pool = graph.pool() # 这里返回的是内存池的id号，可以在其他graph执行时被填入，共用内存池。
         return graph, out
 
     def replay(self, forward_batch: ForwardBatch):
@@ -401,6 +421,7 @@ class CudaGraphRunner:
             self.seq_lens.fill_(1)
             self.out_cache_loc.zero_()
 
+        # 将实际数据拷贝到输入buffer中，在graph捕获的run_once里会从这些buffer里面取数据。
         # Common inputs
         self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
@@ -428,7 +449,7 @@ class CudaGraphRunner:
         )
 
         # Replay
-        self.graphs[bs].replay()
+        self.graphs[bs].replay()  # 再次计算之前捕获的计算全流程，out = run_once()，其中的out已经被指向了self.output_buffers[bs]，所以从self.output_buffers[bs]里取数据即可。
         next_token_logits, hidden_states = self.output_buffers[bs]
 
         logits_output = LogitsProcessorOutput(

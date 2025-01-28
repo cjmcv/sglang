@@ -50,7 +50,13 @@ class LoadBalanceMethod(Enum):
         except KeyError as exc:
             raise ValueError(f"Invalid load balance method: {method}") from exc
 
-
+# 数据并行会通过这个类来分配Scheduler，涉及到负载均衡和多gpu间交互
+# 如单机4卡采用tp2+dp2方式进行，即dp_size为2，会开两个线程执行launch_worker_func，
+# launch_worker_func里会按tp2开启两个进程运行Scheduler(跟非数据并行一样)
+# 为什么dp2开两个线程，每个线程里按开tp2开两个进程？
+# ---- 线程只是用来开进程的，实际总共也开了4个进程。用线程而不是直接for循环开的目的是为了需要先关掉socket后再一起开进程？
+# 数据如何分发？
+# ---- 创建进程时会指定PortArgs，dp_rank和tp_rank。数据会根据这几个参数进行分发。
 class DataParallelController:
     """A controller that dispatches requests to multiple data parallel workers."""
 

@@ -102,6 +102,23 @@ class LoRAManager:
         self.dtype = dtype
 
         workspace_buffer = torch.empty(1 * 1024 * 1024, dtype=torch.int8, device="cuda")
+        # flashinfer里实现的分段矩阵乘法。
+        # 里面会按分段后分别进行矩阵.
+        # def run(
+        #     self,
+        #     x: torch.Tensor,
+        #     weights: torch.Tensor,
+        #     batch_size: int,
+        #     weight_column_major: bool,
+        #     seg_lens: Optional[torch.Tensor] = None,
+        #     seg_indptr: Optional[torch.Tensor] = None,
+        #     weight_indices: Optional[torch.Tensor] = None,
+        # ) -> torch.Tensor:
+        # x是A矩阵，weights是B矩阵，batch_size表示分多少片（一个seq一片），
+        # weight_column_major表示B矩阵是否为列优先，对于fc层的gemm不是常规的gemm，B矩阵应该为列优先。
+        # seg_lens，其实也是seq_len，是一个列表，里面每个元素表示该下标对应的片段长度（对应行数）。
+        # seg_indptr，列表，表示每个seq的起始行号。
+        # weight_indices，B矩阵每个分片的buffer id号。与 self.A_buffer[lora_weight_name][i][buffer_id] 中的[buffer_id]对应。
         self.segment_gemm = SegmentGEMMWrapper(workspace_buffer)
 
         self.init_loras()
@@ -128,6 +145,8 @@ class LoRAManager:
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
 
+    # 1. 基于给定的lora_path，获取配置文件和目标module，configs和target_modules都是有多份的，对应不同的模块。
+    # 2. 每个目标模块分配一个LoRAAdapter，并初始化权重 initialize_weights。self.loras的元素都是 LoRAAdapter 
     def init_loras(self):
         # get configs and target modules
         self.configs = {}
@@ -167,6 +186,7 @@ class LoRAManager:
             )
             self.loras[-1].initialize_weights()
 
+        # 处理一些其他的配置信息
         # misc lora configs
         self.max_lora_dim = max([x.hf_config["r"] for x in self.configs.values()])
         self.scaling = self.loras[0].scaling
@@ -174,6 +194,7 @@ class LoRAManager:
         assert all(x.hf_config["r"] == self.max_lora_dim for x in self.configs.values())
         assert all(x.scaling == self.scaling for x in self.loras)
 
+        # monkey patch：即 “猴子补丁”，是一种在运行时动态修改代码的技术。
         # monkey patch to use the LoRA version
         self.lora_modules = []
         for module_name, module in self.get_target_modules():
@@ -181,6 +202,8 @@ class LoRAManager:
                 (module_name, self.set_lora_module(module_name, module))
             )
 
+    # lora内存池，里面包含A和B矩阵的内存分配。
+    # 各个目标模块里的A矩阵如大小一致者，会复用内存。B矩阵亦然。
     def init_lora_memory_pool(self):
         # preallocate lora memory pool
         self.A_buffer = {}
@@ -254,7 +277,7 @@ class LoRAManager:
             return
 
         for i in range(num_layer):
-            layer_weights = self.loras[self.lora_id[uid]].layers[i].weights
+            layer_weights = self.loras[self.lora_id[uid]].layers[i].weights # 一个lora模块里有多个层，每个层都有自己的名字和权重，[buffer_id]可对应lora模块id
             for name, weights in layer_weights.items():
                 if "lora_A" in name:
                     lora_weight_name = self.get_weight_name(name, 0)
@@ -265,6 +288,8 @@ class LoRAManager:
                     if lora_weight_name:
                         self.B_buffer[lora_weight_name][i][buffer_id].copy_(weights)
 
+    # lora batch，即是多个lora模块组合而成的一个batch。因为每个lora模块里，针对相同的类型和层id，其权重维度都一样。
+    # 可以把这些权重放到一起使用segment_gemm来一起计算。
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
         # load active loras into lora memory pool
         cur_uids = set(forward_batch.lora_paths)
@@ -309,6 +334,9 @@ class LoRAManager:
         for module_name, module in self.lora_modules:
             layer_id = get_layer_id(module_name)
 
+            # ab buffer都是按lora模块，层类型，层id三个索引进行划分。对于同类型和同id，不同lora模块的数据可以一起算。
+            # 如 self.A_buffer[lora_weight_name][i][buffer_id]， 里面的[buffer_id]会跟lora模块一一对应。
+            # 所以计算时，seg_indptr分a矩阵，weight_indices分b矩阵。各自单独计算gemm。搜 self.segment_gemm = SegmentGEMMWrapper(workspace_buffer) 看参数定义
             if "qkv_proj" not in module_name:
                 weight_name = self.get_weight_name(module_name, 0)
                 module.set_lora_info(

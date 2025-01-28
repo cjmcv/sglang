@@ -66,6 +66,7 @@ class CacheAgnosticPolicy(Enum):
     RANDOM = "random"
 
 
+# 调度策略
 class SchedulePolicy:
     Policy = Union[CacheAwarePolicy, CacheAgnosticPolicy]
 
@@ -78,6 +79,7 @@ class SchedulePolicy:
             req_to_token_pool=None, token_to_kv_pool=None, disable=False
         )
 
+    # 按预设策略,重排waiting_queue, 并检索前缀是否已被计算
     def calc_priority(self, waiting_queue: List[Req]) -> bool:
         policy = self._determine_active_policy(waiting_queue)
 
@@ -252,11 +254,11 @@ class PrefillAdder:
         self,
         tree_cache: BasePrefixCache,
         token_to_kv_pool: BaseTokenToKVPool,
-        running_batch: ScheduleBatch,
+        running_batch: ScheduleBatch,        # 当前输入running_batch是之前计算留下的seq，即全是decode的
         new_token_ratio: float,
         rem_input_tokens: int,
         rem_chunk_tokens: Optional[int],
-        mixed_with_decode_tokens: int = 0,
+        mixed_with_decode_tokens: int = 0,   # chunked prefill中一个chunk顺带的deocde数量
     ):
         self.tree_cache = tree_cache
         self.token_to_kv_pool = token_to_kv_pool
