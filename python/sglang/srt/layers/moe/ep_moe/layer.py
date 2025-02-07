@@ -91,7 +91,8 @@ class GroupedGemmRunner(torch.nn.Module):
             )
         return c
 
-
+# 专家并行的MoE实现方式，与fused_moe_triton里的FusedMoE相对应。（enable_ep_moe则用EPMoE, 否则使用FusedMoE）
+# 专家并行时，专家网络会分布在不同设备中。与fused_moe_triton中的FusedMoE是平级互替关系。
 class EPMoE(torch.nn.Module):
     """
     MoE Expert Parallel Impl
@@ -128,6 +129,7 @@ class EPMoE(torch.nn.Module):
         self.num_experts = num_experts
         assert self.num_experts % self.tp_size == 0
         self.num_experts_per_partition = self.num_experts // self.tp_size
+        # 标记该节点负责的专家的id号范围
         self.start_expert_id = self.tp_rank * self.num_experts_per_partition
         self.end_expert_id = self.start_expert_id + self.num_experts_per_partition - 1
 
@@ -146,6 +148,9 @@ class EPMoE(torch.nn.Module):
             self.use_fp8_w8a8 = False
             self.activation_scheme = None
         else:
+            # 目前只支持e4m3的fp8_w8a8。不支持e5m2，因为官方训练使用的是 E4M3 格式以获得更高的精度。
+            # 而不是前向 E4M3，反向 E5M2。认为这种方法的可行性归功于细粒度量化策略，即 tile 和 block-wise scale。
+            # 通过对更小组的元素进行操作，有效地在分组元素之间共享指数位，缓解了动态范围有限的影响。
             self.quant_method: Optional[QuantizeMethodBase] = Fp8EPMoEMethod(
                 quant_config
             )
@@ -164,6 +169,7 @@ class EPMoE(torch.nn.Module):
 
         self.grouped_gemm_runner = None
 
+    
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
 
@@ -171,7 +177,8 @@ class EPMoE(torch.nn.Module):
             self.grouped_gemm_runner = GroupedGemmRunner(
                 hidden_states.device, use_flashinfer=False  # TODO: use flashinfer
             )
-
+        
+        # router_logits 是门控网路的输出，筛选出得到高分的专家网络。
         topk_weights, topk_ids = select_experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
@@ -301,6 +308,8 @@ class EPMoE(torch.nn.Module):
         )
         return output
 
+    # 生成映射表，里面指定了(param_name, weight_name, expert_id, shard_id)，会被充当weight_loader函数的参数
+    # make_expert_params_mapping在models/DeepseekV2ForCausalLM.load_weights中调用，喂入到weight_loader中。
     @classmethod
     def make_expert_params_mapping(
         cls,
@@ -338,10 +347,13 @@ class EPMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
+        # 约束只加载当前节点所负责的专家网络
         if expert_id < self.start_expert_id or expert_id > self.end_expert_id:
             return
+        # 调整专家网络的id号，从全局的id调整为自己的局部id, 使其从0递增。
         expert_id = expert_id - self.start_expert_id
 
+        # 权重名字必须是w1/w2/w3.
         if shard_id not in ("w1", "w2", "w3"):
             raise ValueError(
                 f"shard_id must be ['w1','w2','w3'] but " f"got {shard_id}."
@@ -353,7 +365,7 @@ class EPMoE(torch.nn.Module):
                 param.data, loaded_weight, weight_name, shard_id, expert_id
             )
             return
-
+        # 将权重对应写入即可
         expert_data = param.data[expert_id]
         if shard_id == "w2":
             param.data[expert_id] = loaded_weight
@@ -493,6 +505,11 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
     def __init__(self, quant_config: Fp8Config):
         self.quant_config = quant_config
 
+    # **extra_weight_attrs为可变关键字参数，允许函数接受任意数量的关键字参数，这些参数会被收集到一个字典中，字典的键是参数名，值是参数值。
+    # 上面EPMoE的init中调用create_weights时，将weight_loader=self.weight_loader，即会被传到extra_weight_attrs里，然后在set_weight_attrs中使用。
+    # 将权重加载函数作为对应层的属性记录到模型中，以便使用self.named_parameters可以访问到。
+    # 所以这里create_weights并未调用到self.weight_loader，不会进行实际的权重加载操作，但会把权重加载函数注册进去。
+    # 实际的权重加载操作在models/DeepseekV2ForCausalLM.load_weights中，通过self.named_parameters把注册好的权重加载拿出来，进行实际的加载操作。
     def create_weights(
         self,
         layer: Module,
@@ -506,6 +523,14 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
         if self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = torch.float8_e4m3fn
 
+        # 权重分为w1/w2/w3, 分别对应gate, up和down_proj，共同定义了专家网络的结构,
+        # 
+        # 如下，w1和w3用一个三维矩阵放在一起[num_experts_per_partition, 2 * intermediate_size, hidden_size] => *size
+        # torch.empty的默认layout是torch.strided，默认情况下，最后一维连续排布，从后往前step。
+        # w1和w3的维度都是[num_experts_per_partition, intermediate_size, hidden_size]
+        # w2的维度是      [num_experts_per_partition, hidden_size, intermediate_size]
+        # 因为是EP专家并行，每个节点只需要加载自己所负责专家网络即可，即num_experts_per_partition，表示每个part负责的专家数量。
+        # 
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
             torch.empty(

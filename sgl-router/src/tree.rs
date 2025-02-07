@@ -83,6 +83,13 @@ fn slice_by_chars(s: &str, start: usize, end: usize) -> String {
 
 impl Tree {
     /*
+    Ïß³Ì°²È«µÄ¶à×â»§»ùÊıÊ÷£¬
+        Õë¶ÔÃ¿¸öworker/tenant¶¼»á»ùÓÚÀúÊ·ÇëÇóĞÅÏ¢ÔÚÂ·ÓÉÆ÷¶ËÎªÆäÔÚ½üËÆ»ùÊıÊ÷ÉÏÎ¬»¤×Ô¼ºµÄÒ»·İÊı¾İ£¬
+    Í¨¹ıprefix_matchÕÒµ½×îºÏÊÊµÄtenant¡£
+    1. Îª¶à¸ö×â»§´æ´¢Êı¾İ£¨¶à¸ö»ùÊıÊ÷µÄÖØµş£©
+    2. ½Úµã¼¶Ëø£¬ÒÔÊµÏÖ¶Ô½ÚµãµÄ²¢·¢·ÃÎÊ
+    3. »ùÓÚ×â»§·ÃÎÊÊ±¼äµÄÒ¶×Ó½Úµã×î½ü×îÉÙÊ¹ÓÃ£¨LRU£©ÌÔÌ­»úÖÆ
+
     Thread-safe multi tenant radix tree
 
     1. Storing data for multiple tenants (the overlap of multiple radix tree)
@@ -624,7 +631,7 @@ impl Tree {
 
         for (i, entry) in children.iter().enumerate() {
             let is_last_child = i == child_count - 1;
-            let new_prefix = format!("{}{}", prefix, if is_last { "    " } else { "â”‚   " });
+            let new_prefix = format!("{}{}", prefix, if is_last { "    " } else { "â”?   " });
 
             result.push_str(&Tree::node_to_string(
                 entry.value(),
@@ -1075,9 +1082,9 @@ mod tests {
         let tree = Arc::new(Tree::new());
 
         let test_pairs = vec![
-            ("ä½ å¥½å—", "tenant1"),
-            ("ä½ å¥½å–”", "tenant2"),
-            ("ä½ å¿ƒæƒ…å¥½å—", "tenant3"),
+            ("ä½ å¥½å—?", "tenant1"),
+            ("ä½ å¥½å–?", "tenant2"),
+            ("ä½ å¿ƒæƒ…å¥½å—?", "tenant3"),
         ];
 
         // Insert sequentially
@@ -1103,9 +1110,9 @@ mod tests {
         let tree = Arc::new(Tree::new());
 
         let test_pairs = vec![
-            ("ä½ å¥½å—", "tenant1"),
-            ("ä½ å¥½å–”", "tenant2"),
-            ("ä½ å¿ƒæƒ…å¥½å—", "tenant3"),
+            ("ä½ å¥½å—?", "tenant1"),
+            ("ä½ å¥½å–?", "tenant2"),
+            ("ä½ å¿ƒæƒ…å¥½å—?", "tenant3"),
         ];
 
         // Create multiple threads for insertion

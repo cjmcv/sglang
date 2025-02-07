@@ -26,12 +26,14 @@ fn copy_request_headers(req: &HttpRequest) -> Vec<(String, String)> {
 
 #[derive(Debug)]
 pub enum Router {
+    // ÂÖÑ¯£¬current_index¼ÇÂ¼µ±Ç°½Úµã£¬ÏÂ´Î·ÃÎÊÕÒÏÂÒ»¸ö
     RoundRobin {
         worker_urls: Arc<RwLock<Vec<String>>>,
         current_index: AtomicUsize,
         timeout_secs: u64,
         interval_secs: u64,
     },
+    // Ëæ»ú
     Random {
         worker_urls: Arc<RwLock<Vec<String>>>,
         timeout_secs: u64,
@@ -39,6 +41,18 @@ pub enum Router {
     },
     CacheAware {
         /*
+            »º´æ¸ĞÖªµÄ¸ºÔØ¾ùºâÂ·ÓÉÆ÷
+            ÀïÃæ°üº¬ÓĞÁ½ÖÖ²ßÂÔ£º1. »ùÓÚ½üËÆ»ùÊıÊ÷µÄ»º´æ¸ĞÖªµÄÊı¾İ·Ö·¢£¨µ±¸ºÔØ¾ùºâÊ±Ê¹ÓÃ£©£¬
+                                 Õë¶ÔÃ¿¸öworker¶¼»á»ùÓÚÀúÊ·ÇëÇóĞÅÏ¢ÔÚÂ·ÓÉÆ÷¶ËÎª¸÷¸öworkerÎ¬»¤ÔÚ½üËÆ»ùÊıÊ÷TreeÄÚÎ¬»¤Ò»·İÊı¾İ£¬Ê÷Àï´æµÄÊÇÔ­Ê¼ÎÄ±¾¶ø²»ÊÇtoken id£¬ÒÔÃâÆµ·±µ÷ÓÃtokenization¡£
+                                 abc. Ã¿¸öĞÂÇëÇó½øÀ´£¬»á¼ìË÷Ã¿¸öworker¶ÔÓ¦µÄÊ÷£¬ÕÒµ½Ò»¸ö¾ßÓĞ×î´óµÄÇ°×ºÆ¥ÅäµÄ¡£
+                                    Èç¹ûÆ¥ÅäÂÊ´óÓÚãĞÖµ£¬ÔòÖ±½Ó·Ö·¢(»º´æ×îÏà¹Ø)£»Èç¹ûĞ¡ÓÚµÈÓÚãĞÖµ£¬Ôò·Ö·¢µ½Ê÷×îĞ¡(¿ÉÓÃ»º´æÈİÁ¿×î´ó)µÄworkerÖĞ¡£
+                                 d. ¶¨ÆÚÊ¹ÓÃLRU(least recently used)ÇåÀíÒ¶×Ó½Úµã£¬·ÀÖ¹ÄÚ´æÒç³ö¡£
+                                 £¨½üËÆ»ùÊıÊ÷´æÔÚÓÚ·Ö·¢´¦£¬ÓÃÓÚ·Ö·¢Ç°µÄ¼ìË÷£»ÍêÕûµÄ»ùÊıÊ÷RadixCache´æÔÚÓÚ¸÷¸öworkerµÄScheduler£¬ÓÃÓÚÊµ¼ÊµÄÇ°×º´¦Àí£©
+                              2. ×î¶Ì¶ÓÁĞµÄ¸ºÔØ¾ùºâ£¨µ±¸ºÔØ²»¾ùºâÊ±Ê¹ÓÃ£©£¬½«ĞÂÇëÇó·Ö·¢µ½´ı´¦ÀíÇëÇóÊı×îÉÙµÄworkerÖĞ¡£
+            ¸ºÔØ¾ùºâµÄÅĞ¶ÏÌõ¼şÊÇ£º
+            1. (max - min) > abs_threshold£¬´ı´¦ÀíÇëÇóÊıµÄ×î´óÖµÓë×îĞ¡ÖµµÄ¾ø¶ÔÖµ²î¾à´óÓÚãĞÖµ¡£
+            2. max > rel_threshold * min£¬´ı´¦ÀíÇëÇóÊıµÄ×îĞ¡Öµ³ËÒÔÒ»¸öÏµÊıºóÈÔ±È×î´óÖµĞ¡¡£
+
             Cache-Aware Load Balancing Router
 
             This router combines two strategies to optimize both cache utilization and request distribution:
@@ -66,7 +80,7 @@ pub enum Router {
             a. For each request, find the worker with the highest prefix match
             b. If match rate > cache_threshold:
             Route to the worker with highest match (likely has relevant data cached)
-            c. If match rate â‰¤ cache_threshold:
+            c. If match rate â‰? cache_threshold:
             Route to the worker with smallest tree size (most available cache capacity)
             d. Background maintenance:
             Periodically evict least recently used leaf nodes to prevent memory overflow
@@ -99,13 +113,13 @@ pub enum Router {
             during the next eviction cycle.
         */
         worker_urls: Arc<RwLock<Vec<String>>>,
-        tree: Arc<Mutex<Tree>>,
+        tree: Arc<Mutex<Tree>>,   // Arc ÊÇ Atomic Reference Counting£¬ÊÇÒ»¸öÖÇÄÜÖ¸Õë£¬ÓÃÓÚÔÚ¶àÏß³Ì»·¾³ÏÂÊµÏÖ¶à¸öËùÓĞÕß¹²ÏíÍ¬Ò»·İÊı¾İ
         running_queue: Arc<Mutex<HashMap<String, usize>>>,
         processed_queue: Arc<Mutex<HashMap<String, usize>>>,
         cache_threshold: f32,
-        balance_abs_threshold: usize,
-        balance_rel_threshold: f32,
-        timeout_secs: u64,
+        balance_abs_threshold: usize,   // abs_threshold
+        balance_rel_threshold: f32,     // rel_threshold
+        timeout_secs: u64,              
         interval_secs: u64,
         _eviction_thread: Option<thread::JoinHandle<()>>,
     },
@@ -122,10 +136,10 @@ pub enum PolicyConfig {
         interval_secs: u64,
     },
     CacheAwareConfig {
-        cache_threshold: f32,
-        balance_abs_threshold: usize,
-        balance_rel_threshold: f32,
-        eviction_interval_secs: u64,
+        cache_threshold: f32,          // Ê¹ÓÃ×î¸ßÆ¥ÅäÂ·ÓÉËùĞèµÄ×îĞ¡Ç°×ºÆ¥Åä±ÈÂÊ¡£µÍÓÚ´ËãĞÖµÊ±£¬½«Â·ÓÉµ½»º´æ¿Õ¼ä¿ÉÓÃÁ¿×î´óµÄ¹¤×÷½Úµã¡£
+        balance_abs_threshold: usize,  // abs_threshold
+        balance_rel_threshold: f32,    // rel_threshold
+        eviction_interval_secs: u64,   // ½üËÆÊ÷µÄ LRU Öğ³öÖÜÆÚÖ®¼äµÄ¼ä¸ô¡£
         max_tree_size: usize,
         timeout_secs: u64,
         interval_secs: u64,
@@ -354,6 +368,7 @@ impl Router {
         const MAX_TOTAL_RETRIES: u32 = 6;
         let mut total_retries = 0;
 
+        // MAX_TOTAL_RETRIES ÊÇÖØ¸´³¢ÊÔ´ÎÊı¡£
         while total_retries < MAX_TOTAL_RETRIES {
             match self.select_first_worker() {
                 Ok(worker_url) => {

@@ -37,16 +37,23 @@ def compute_src2dst_triton_kernel(
 
 
 def run_moe_ep_preproess(topk_ids: torch.Tensor, num_experts: int):
+    # 从小到大排序，reorder_topk_ids是排序后的id好，reorder_ids是调整后对应的原始索引
     reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
     seg_indptr = torch.zeros(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
+    # numel()是得到元素总数
     src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
 
+    # 计算一个分割指针数组 seg_indptr，用于将数据按照专家（expert）进行分割
+    # 通过二分查找的方式在排序后的数组 reorder_topk_ids 中找到特定专家 expert 应该插入的位置，
+    # 然后将该位置的索引值存储到 seg_indptr 中相应的专家位置加 1 的地方。
     compute_seg_indptr_triton_kernel[(num_experts,)](
         reorder_topk_ids, seg_indptr, topk_ids.numel()
     )
 
     BLOCK_SIZE = 512
     grid = (triton.cdiv(topk_ids.numel(), BLOCK_SIZE),)
+    # 目的是根据 reorder_ids 数组创建一个从源索引（src_id）到目标索引（dst_id）的映射，
+    # 并将该映射存储在 src2dst 数组中。也就是说，对于每个源索引，找到它在重排序后的目标索引，并记录下来。
     compute_src2dst_triton_kernel[grid](
         reorder_ids, src2dst, topk_ids.numel(), BLOCK_SIZE
     )

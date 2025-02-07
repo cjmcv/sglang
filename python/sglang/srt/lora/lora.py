@@ -135,11 +135,14 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         super().__init__(base_layer, segment_gemm, lora_rank, scaling)
 
     # 该函数会在ForwardBatch.init_new->prepare_lora_batch中被调用，即每次推理前都会调用一次，以更新当前batch数据对应的lora信息
-    # 信息重点是bs，seg_indptr 和 weight_indices。
+    # 信息重点是bs，seg_indptr（请求划分） 和 weight_indices。
+    # set_lora是这个ForwardBatch是否需要计算lora的标志位，即如果调用到set_lora_info，则需要计算lora，否则不计算。看父类ColumnParallelLinearWithLoRA的forward函数。
+    # 因为在初始化时，init_loras已经完成了对该模型的层的替换，把相对应的层都换成了带lora的新层。新层会先计算原始层的内容，然后计算lora。
+    # 但因为不是每个请求都需要计算，而且lora模块会根据请求类型更换，所以有set_lora表示是否需要计算lora，其他参数表示要计算的lora内容。TODO:目前set_lora_info是
     def set_lora_info(
         self, A_buffer_qkv, B_buffer_q, B_buffer_kv, bs, seg_indptr, weight_indices
     ):
-        self.set_lora = True
+        self.set_lora = True              
         self.A_buffer_qkv = A_buffer_qkv
         self.B_buffer_q = B_buffer_q
         self.B_buffer_kv = B_buffer_kv

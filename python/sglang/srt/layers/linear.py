@@ -209,7 +209,7 @@ class LinearBase(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
-
+# 就是普通线性层？
 class ReplicatedLinear(LinearBase):
     """Replicated linear layer.
 
