@@ -201,6 +201,7 @@ class DeepseekV2MoE(nn.Module):
         )
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
+        # Note: 这里tp_size > 1, 不仅只针对TP，对于EP而言tp_size也是大于1，启用EP时，ep_size=tp_size，且TP不使用。这里的MoE的TP和EP只能二选一。
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
@@ -399,6 +400,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
+        # 使用dp时，这些线性层都是普通的线性层，而不使用DP时才会有Parallel的线性层。
+        # 即这里的实现中，DP和TP无法同时用于加速MLA。
         if use_dp:
             # For data parallel attention
             if self.q_lora_rank is not None:
@@ -438,7 +441,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         else:
             # For tensor parallel attention
             if self.q_lora_rank is not None:
-                # lora模块计算：Y=X*W0 + X*A*B
+                # lora模块计算：Y=X*W0 + X*A*B?
                 self.q_a_proj = ReplicatedLinear(
                     self.hidden_size,
                     self.q_lora_rank,
@@ -538,7 +541,7 @@ class DeepseekV2AttentionMLA(nn.Module):
     ) -> torch.Tensor:
         # Use normal computation for prefill and use weight absorption for extend/decode
         # 在chunked prefill下，prefill阶段也可能是is_extend，需要额外判断extend_prefix_lens是否为0，为0才算是prefill的开头第一个chunk。
-        # 为什么prefix为0时不能使用？
+        # MQ: 为什么prefix为0时不能使用？
         if (
             forward_batch.forward_mode.is_extend()
             and forward_batch.extend_prefix_lens.sum() == 0
@@ -561,6 +564,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
             )
+        # 单独将q的pe(位置编码)部分拿出来，需要计算rotary_emb 旋转位置编码，对应q的apply rope部分，算完后合并回去q，充当mha的q的输入。
         _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
         kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
@@ -584,6 +588,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch.token_to_kv_pool.set_kv_buffer(
             self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
         )
+        # 调用mha
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
@@ -607,8 +612,10 @@ class DeepseekV2AttentionMLA(nn.Module):
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
             )
+        # 取出q_pe，需要进而计算位置编码 rotary_emb，对应weight_absorption中的q的apply rope部分
+        # 另外q_nope，需要跟先乘以w_kc，对应weight_absorption中的Wuc Linear1
+        # q_nope经过线性层得到的q_nope_out会跟q_pe经过rope计算结果合并在一起，充当mqa的q输入。
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-
         if self.w_kc.dtype == torch.float8_e4m3fnuz:
             # TODO(kernel): add bmm_fp8 for torch.float8_e4m3fnuz
             q_nope_out = torch.bmm(
@@ -624,6 +631,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
         else:
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
+
+        # [seq_len, head_dim, latent_dim+rope_dim]
         q_input[..., : self.kv_lora_rank] = q_nope_out.transpose(0, 1)
 
         latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
@@ -637,9 +646,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         q_input[..., self.kv_lora_rank :] = q_pe
         k_input[..., self.kv_lora_rank :] = k_pe
 
+        # 调用mqa
         attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
+        # 需要多乘以w_vc，将维度升回去。对应weight_absorption中的Wuc Linear2
         if self.w_vc.dtype == torch.float8_e4m3fnuz:
             # TODO(kernel): add bmm_fp8 for torch.float8_e4m3fnuz
             attn_bmm_output = torch.bmm(
@@ -818,18 +829,20 @@ class DeepseekV2DecoderLayer(nn.Module):
 # -> for 多个相同的DeepseekV2DecoderLayer (数量是num_hidden_layers)
 #    -> RMSNorm
 #    -> DeepseekV2AttentionMLA - self attention
+#       -> forward_normal
+#       -> forward_absorb 权重吸收，
 #    -> RMSNorm
-#    -> DeepseekV2MoE + DeepseekV2MLP组合, 
+#    -> DeepseekV2MoE + DeepseekV2MLP组合 (由first_k_dense_replace和moe_layer_freq两个参数控制组合情况,在V3和R1里都是分别为3和1) 
 #          <DeepseekV2MoE>
 #       -> shared_experts (DeepseekV2MLP类型，共享部分，每个样本都会进入计算)
 #       -> MoEGate        (门控网络，选择专家)
-#       -> experts, 有 EPMoE (专家并行，一个节点存放部分专家) 
-#                   或 FusedMoE（所有专家混合在一起，然后用TP拆分每个专家网络的权重，每个节点算完负责的部分后需要all reduce结果）
-#       -> all reduce专家结果
+#       -> experts, 有 EPMoE    (专家并行，一个节点存放部分专家) 
+#                   或 FusedMoE（所有专家混合在一起，然后用TP拆分每个专家网络的权重，打包做gemm）
+#       -> all reduce 专家结果 （无论是EP还是TP）
 #          <DeepseekV2MLP>
 #       ->  gate_up_proj - MergedColumnParallelLinear
 #       ->  act_fn       - SiluAndMul
-#       ->  down_proj    - RowParallelLinear
+#       ->  down_proj    - RowParallelLinear - all reduce
 # -> RMSNorm
 class DeepseekV2Model(nn.Module):
 
@@ -879,7 +892,6 @@ class DeepseekV2Model(nn.Module):
         return hidden_states
 
 # 最外层类
-# 
 class DeepseekV2ForCausalLM(nn.Module):
 
     def __init__(
@@ -1040,6 +1052,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                             weight, weight_scale, weight_block_size
                         )
                         self_attn.w_scale = scale
+                # 注意到 w = self_attn.kv_b_proj.weight，即w_kc/w_vc是从升维恢复成多头的线性层的权重中拆分出来的。
                 w_kc, w_vc = w.unflatten(
                     0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
                 ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
@@ -1059,7 +1072,6 @@ class DeepseekV2ForCausalLM(nn.Module):
 # R1 是基于 DeepSeek V3 模型进一步进行训练得到的，V3是通用型的大语言模型，R1 则是推理优先的模型，侧重于处理复杂的推理任务。
 # V3 总参数 6710 亿，每 token 激活 370 亿参数；R1 有不同规模的蒸馏版本，参数范围在 15 亿到 700 亿之间。
 #
-# The dp size should be equal to the tp size？？不使用PP的原因，
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
     pass
 

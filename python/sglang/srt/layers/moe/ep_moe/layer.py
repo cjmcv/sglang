@@ -91,6 +91,9 @@ class GroupedGemmRunner(torch.nn.Module):
             )
         return c
 
+# ep的pr: https://github.com/sgl-project/sglang/pull/2203
+# mla dp的pr: https://github.com/sgl-project/sglang/pull/1970
+# https://mp.weixin.qq.com/s/hRVpCFynybW37jogW9_BXA
 # 专家并行的MoE实现方式，与fused_moe_triton里的FusedMoE相对应。（enable_ep_moe则用EPMoE, 否则使用FusedMoE）
 # 专家并行时，专家网络会分布在不同设备中。与fused_moe_triton中的FusedMoE是平级互替关系。
 class EPMoE(torch.nn.Module):
@@ -124,6 +127,7 @@ class EPMoE(torch.nn.Module):
         self.tp_size = (
             tp_size if tp_size is not None else get_tensor_model_parallel_world_size()
         )
+        # 用了tp_rank代替ep_rank的意思。
         self.tp_rank = get_tensor_model_parallel_rank()
 
         self.num_experts = num_experts

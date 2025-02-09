@@ -209,7 +209,7 @@ class LinearBase(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
-# 就是普通线性层？
+# 就是无TP并行的普通线性层
 class ReplicatedLinear(LinearBase):
     """Replicated linear layer.
 
@@ -291,7 +291,12 @@ class ReplicatedLinear(LinearBase):
         s += f", bias={self.bias is not None}"
         return s
 
-
+# 权重矩阵按列进行划分，这里依照普通矩阵乘法。
+# Pytorch里的nn.Linear和tf里的tf.keras.layers.Dense，即FC层，都采用普通gemm进行，不需要对权重进行转置。
+# 个别框架的fc层需要转置权重，是因为线性代数中正常的线性变换里，权重是需要转置的，才符合传统数学定义。
+# 
+# GEMM中，输入X的一行，需要和权重A的一列里，每个元素一一对应相乘并累加得到一个元素结果。
+# 这里权重A按列切分，则一个设备中X的一行和A的一列已经完成累加计算，得到一个点的最终结果，因此只需要将其他点的数据收集起来即可，即all gather。
 class ColumnParallelLinear(LinearBase):
     """Linear layer with column parallelism.
 
@@ -1078,7 +1083,9 @@ class QKVParallelLinear(ColumnParallelLinear):
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
-
+# 权重矩阵按行进行划分，不同的设备负责计算权重矩阵的不同行与输入的部分乘积。
+# 在线性层计算中，nn.Linear采用的是普通gemm，权重不需要转置。则输入X一行会和权重A一列，计算累加得到一个点。
+# 这里将A按行划分，则X一行和A一行计算得到的是一行点的中间结果，最终结果还需要将其他行计算的结果累加起来，所以需要all reduce。对比ColumnParallelLinear。
 class RowParallelLinear(LinearBase):
     """Linear layer with row parallelism.
 
