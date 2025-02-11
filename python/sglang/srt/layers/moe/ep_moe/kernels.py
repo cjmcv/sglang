@@ -35,7 +35,7 @@ def compute_src2dst_triton_kernel(
     src_id = tl.load(reorder_ids + dst_id, mask=mask)
     tl.store(src2dst + src_id, dst_id, mask=mask)
 
-
+# <NT> 
 def run_moe_ep_preproess(topk_ids: torch.Tensor, num_experts: int):
     # 从小到大排序，reorder_topk_ids是排序后的id好，reorder_ids是调整后对应的原始索引
     reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)

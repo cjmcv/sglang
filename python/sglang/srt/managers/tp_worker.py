@@ -154,7 +154,7 @@ class TpModelWorker:
             self.model_runner.token_to_kv_pool,
         )
 
-    # 推理计算入口函数，调用
+    # <NT> 推理计算入口函数，调用
     # model_runner.forward
     #                 -> forward_decode / forward_extend
     #                    -> model.forward 

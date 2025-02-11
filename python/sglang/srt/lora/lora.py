@@ -134,7 +134,7 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
     ) -> None:
         super().__init__(base_layer, segment_gemm, lora_rank, scaling)
 
-    # 该函数会在ForwardBatch.init_new->prepare_lora_batch中被调用，即每次推理前都会调用一次，以更新当前batch数据对应的lora信息
+    # <NT> 该函数会在ForwardBatch.init_new->prepare_lora_batch中被调用，即每次推理前都会调用一次，以更新当前batch数据对应的lora信息
     # 信息重点是bs，seg_indptr（请求划分） 和 weight_indices。
     # set_lora是这个ForwardBatch是否需要计算lora的标志位，即如果调用到set_lora_info，则需要计算lora，否则不计算。看父类ColumnParallelLinearWithLoRA的forward函数。
     # 因为在初始化时，init_loras已经完成了对该模型的层的替换，把相对应的层都换成了带lora的新层。新层会先计算原始层的内容，然后计算lora。
@@ -150,7 +150,7 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         self.seg_indptr = seg_indptr
         self.weight_indices = weight_indices
 
-    # apply_lora会在每次调用该层的forward时调用。
+    # <NT> apply_lora会在每次调用该层的forward时调用。
     # lora的计算公式：无lora Y=X*W, 有lora Y=X*(W+AB)
     # 可以分成两种方式计算：
     # 1. 事先将lora的AB矩阵合入到原来矩阵权重中，得到新的W1=W0+A*B，Y=X*W1
@@ -276,7 +276,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
 def get_lora_layer(
     layer: nn.Module, segment_gemm, lora_rank, scaling
 ) -> BaseLayerWithLoRA:
-    # 下面是lora支持的层，左边是并入lora前的(即原始模型定义的)，右边是并入lora后的。
+    # <NT> 下面是lora支持的层，左边是并入lora前的(即原始模型定义的)，右边是并入lora后的。
     # 函数输入的layer就是原始模型定义层，通过这个层，看能否找到对应的lora层，
     # 找到则构造一个对应lora层对象，并返回。如果找不到则不支持。
     # note: 都带有Parallel字样，因为这些层都考虑了张量并行，会按rank进行权重的加载和计算。

@@ -615,7 +615,11 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
         return 1.0
     return 0.1 * mscale * math.log(scale) + 1.0
 
-
+# <NT> Deepseek在MLA中使用的旋转位置编码，其中的YaRN: Efficient Context Window Extension of Large Language Models
+# 旋转位置编码的核心思想是将位置信息通过旋转操作融入到 输入向量 中。
+# 对于序列中的每个位置，都有一个对应的旋转矩阵，通过该矩阵对输入向量进行旋转，使得向量的表示包含了位置信息。
+# 并且，相对位置信息可以通过向量之间的点积体现出来，这有助于模型更好地捕捉序列中元素之间的相对位置关系。
+# 
 class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
     """RotaryEmbedding extended with YaRN method.
 

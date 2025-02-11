@@ -35,7 +35,7 @@ from sglang.srt.layers.custom_op_util import register_custom_op
 
 logger = logging.getLogger(__name__)
 
-# RMSNorm 跟常说的layernorm一样，也是逐个layer做归一化，但与layernorm算法的公式不同。
+# <NT> RMSNorm 跟常说的layernorm一样，也是逐个layer做归一化，但与layernorm算法的公式不同。
 # 这里都放到layernorm.py下可能这里的layernorm是指逐层归一化的意思，而不是layernorm算法。
 @register_custom_op("sglang_rmsnorm")
 class RMSNorm(CustomOp):

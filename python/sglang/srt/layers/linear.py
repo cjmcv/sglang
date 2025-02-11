@@ -183,6 +183,7 @@ class LinearBase(torch.nn.Module):
         quant_config: Quantization configure.
     """
 
+    # <NT> quant_method由quant_config得到，quant_config会从模型定义层的时候传入
     def __init__(
         self,
         input_size: int,
@@ -209,7 +210,7 @@ class LinearBase(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
-# 就是无TP并行的普通线性层
+# <NT> 就是无TP并行的普通线性层?
 class ReplicatedLinear(LinearBase):
     """Replicated linear layer.
 
@@ -291,12 +292,16 @@ class ReplicatedLinear(LinearBase):
         s += f", bias={self.bias is not None}"
         return s
 
-# 权重矩阵按列进行划分，这里依照普通矩阵乘法。
+# <NT> 权重矩阵按列进行划分，这里依照普通矩阵乘法。
 # Pytorch里的nn.Linear和tf里的tf.keras.layers.Dense，即FC层，都采用普通gemm进行，不需要对权重进行转置。
 # 个别框架的fc层需要转置权重，是因为线性代数中正常的线性变换里，权重是需要转置的，才符合传统数学定义。
 # 
 # GEMM中，输入X的一行，需要和权重A的一列里，每个元素一一对应相乘并累加得到一个元素结果。
 # 这里权重A按列切分，则一个设备中X的一行和A的一列已经完成累加计算，得到一个点的最终结果，因此只需要将其他点的数据收集起来即可，即all gather。
+# 张量并行中，因为每个元素已经独立算完，进入后面的层也需要做TP，所以该算子默认不做all gather，即gather_output=False。
+# ColumnParallelLinear的每个节点的输入数据需要是完整的，如果输入较大，会比较占显存。
+#
+# 例子看: python/sglang/srt/models/deepseek_v2.py中DeepseekV2MLP的定义注释。
 class ColumnParallelLinear(LinearBase):
     """Linear layer with column parallelism.
 
@@ -446,8 +451,10 @@ class ColumnParallelLinear(LinearBase):
         s += f", tp_size={self.tp_size}"
         s += f", gather_output={self.gather_output}"
         return s
-
-
+    
+# <NT> 将多个线性层的权重矩阵合并为一个更大的矩阵，再按列进行分割。
+# 合并的线性层处于平级，输入一样，无前后依赖关系。
+# 具体合并多少个，看output_sizes: List[int]，List有多少个元素就是合并多少个。
 class MergedColumnParallelLinear(ColumnParallelLinear):
     """Packed linear layers with column parallelism.
 
@@ -708,7 +715,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             use_presharded_weights=self.use_presharded_weights,
         )
 
-# 线性层(全连接层)，用于attention的QKV的线性变换。权重矩阵沿着输出维度拼接在一起，layer则沿着head维度并行。
+# <NT> 线性层(全连接层)，用于attention的QKV的线性变换。权重矩阵沿着输出维度拼接在一起，layer则沿着head维度并行。
 # 输出矩阵就是QKV的拼接矩阵。
 class QKVParallelLinear(ColumnParallelLinear):
     """Linear layers for the attention's QKV transformation.
@@ -792,7 +799,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             tp_size=tp_size,
         )
 
-    # 首地址是q，k的首地址是q往后偏移q的大小(self.num_heads * self.head_size), v的首地址是k往后偏移自己的大小(self.num_kv_heads * self.head_size)
+    # <NT> 首地址是q，k的首地址是q往后偏移q的大小(self.num_heads * self.head_size), v的首地址是k往后偏移自己的大小(self.num_kv_heads * self.head_size)
     def _get_shard_offset_mapping(self, loaded_shard_id: str):
         shard_offset_mapping = {
             "q": 0,
@@ -802,7 +809,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         }
         return shard_offset_mapping.get(loaded_shard_id)
 
-    # 对于分组的attention(如GQA), num_heads会大于num_kv_heads，且是其倍数关系。其他不分组的attention，num_heads和num_kv_heads一般一致。
+    # <NT> 对于分组的attention(如GQA), num_heads会大于num_kv_heads，且是其倍数关系。其他不分组的attention，num_heads和num_kv_heads一般一致。
     def _get_shard_size_mapping(self, loaded_shard_id: str):
         shard_size_mapping = {
             "q": self.num_heads * self.head_size,
@@ -1083,9 +1090,12 @@ class QKVParallelLinear(ColumnParallelLinear):
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
-# 权重矩阵按行进行划分，不同的设备负责计算权重矩阵的不同行与输入的部分乘积。
+# <NT> 权重矩阵按行进行划分，不同的设备负责计算权重矩阵的不同行与输入的部分乘积。
 # 在线性层计算中，nn.Linear采用的是普通gemm，权重不需要转置。则输入X一行会和权重A一列，计算累加得到一个点。
 # 这里将A按行划分，则X一行和A一行计算得到的是一行点的中间结果，最终结果还需要将其他行计算的结果累加起来，所以需要all reduce。对比ColumnParallelLinear。
+# 张量并行中，因为每个元素都没有算完，后面的层要做TP，必须先将结果做all reduce汇总，才能继续算。所以该算子默认要做all reduce，即reduce_results=True。
+# input_is_parallel表示输入数据已经切分好了，可以前面层可以搭配ColumnParallelLinear使用。则ColumnParallelLinear不需要all gather，RowParallelLinear也不需要在切分输入数据。
+# 例子看: python/sglang/srt/models/deepseek_v2.py中DeepseekV2MLP的定义注释。
 class RowParallelLinear(LinearBase):
     """Linear layer with row parallelism.
 

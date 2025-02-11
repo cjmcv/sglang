@@ -113,7 +113,7 @@ class TritonAttnBackend(AttentionBackend):
         return 1
 
 
-    # 该函数会在(python/sglang/srt/models/qwen2.py#157 -> self.attn)里调用。
+    # <NT> 该函数会在(python/sglang/srt/models/qwen2.py#157 -> self.attn)里调用。
     # self.attn是RadixAttention对象，在forward时，里面会根据forward_batch.forward_mode.is_decode()来确定调用forward_extend还是forward_decode。
     # 输入参数的qkv由attention层之前的线性层计算输出的。其中的k和v的进入forwad时就会被添加到该ForwardBatch维护的kvcache buffer中 (set_kv_buffer)，每次调用都会被叠加。
     # 

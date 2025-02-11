@@ -26,7 +26,7 @@ fn copy_request_headers(req: &HttpRequest) -> Vec<(String, String)> {
 
 #[derive(Debug)]
 pub enum Router {
-    // 轮询，current_index记录当前节点，下次访问找下一个
+    // <NT> 轮询，current_index记录当前节点，下次访问找下一个
     RoundRobin {
         worker_urls: Arc<RwLock<Vec<String>>>,
         current_index: AtomicUsize,
@@ -41,7 +41,7 @@ pub enum Router {
     },
     CacheAware {
         /*
-            缓存感知的负载均衡路由器
+            <NT> 缓存感知的负载均衡路由器
             里面包含有两种策略：1. 基于近似基数树的缓存感知的数据分发（当负载均衡时使用），
                                  针对每个worker都会基于历史请求信息在路由器端为各个worker维护在近似基数树Tree内维护一份数据，树里存的是原始文本而不是token id，以免频繁调用tokenization。
                                  abc. 每个新请求进来，会检索每个worker对应的树，找到一个具有最大的前缀匹配的。
@@ -135,6 +135,7 @@ pub enum PolicyConfig {
         timeout_secs: u64,
         interval_secs: u64,
     },
+    // <NT> 
     CacheAwareConfig {
         cache_threshold: f32,          // 使用最高匹配路由所需的最小前缀匹配比率。低于此阈值时，将路由到缓存空间可用量最大的工作节点。
         balance_abs_threshold: usize,  // abs_threshold

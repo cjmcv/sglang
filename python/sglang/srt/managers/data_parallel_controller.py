@@ -50,7 +50,7 @@ class LoadBalanceMethod(Enum):
         except KeyError as exc:
             raise ValueError(f"Invalid load balance method: {method}") from exc
 
-# 数据并行会通过这个类来分配Scheduler，涉及到负载均衡和多gpu间交互
+# <NT> 数据并行会通过这个类来分配Scheduler，涉及到负载均衡和多gpu间交互
 # 如单机4卡采用tp2+dp2方式进行，即dp_size为2，会开两个线程执行launch_worker_func，
 # launch_worker_func里会按tp2开启两个进程运行Scheduler(跟非数据并行一样)
 # 为什么dp2开两个线程，每个线程里按开tp2开两个进程？

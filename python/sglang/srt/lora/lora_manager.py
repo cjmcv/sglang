@@ -102,7 +102,7 @@ class LoRAManager:
         self.dtype = dtype
 
         workspace_buffer = torch.empty(1 * 1024 * 1024, dtype=torch.int8, device="cuda")
-        # flashinfer里实现的分段矩阵乘法。
+        # <NT> flashinfer里实现的分段矩阵乘法。
         # 里面会按分段后分别进行矩阵.
         # def run(
         #     self,
@@ -145,8 +145,8 @@ class LoRAManager:
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
 
-    # 1. 基于给定的lora_path，获取配置文件和目标module，configs和target_modules都是有多份的，对应不同的模块。
-    # 2. 每个目标模块分配一个LoRAAdapter，并初始化权重 initialize_weights。self.loras的元素都是 LoRAAdapter 
+    # <NT> 1. 基于给定的lora_path，获取配置文件和目标module，configs和target_modules都是有多份的，对应不同的模块。
+    #      2. 每个目标模块分配一个LoRAAdapter，并初始化权重 initialize_weights。self.loras的元素都是 LoRAAdapter 
     def init_loras(self):
         # get configs and target modules
         self.configs = {}
@@ -194,7 +194,7 @@ class LoRAManager:
         assert all(x.hf_config["r"] == self.max_lora_dim for x in self.configs.values())
         assert all(x.scaling == self.scaling for x in self.loras)
 
-        # monkey patch：即 “猴子补丁”，是一种在运行时动态修改代码的技术。
+        # <NT> monkey patch：即 “猴子补丁”，是一种在运行时动态修改代码的技术。
         # 将普通层替换层绑定了lora的层： set_lora_module-> get_lora_layer(如 MergedColumnParallelLinear 替换成 MergedColumnParallelLinearWithLoRA) / replace_submodule
         # 绑定了lora层的新层会先运行原来的层base_layer，然后额外运行lora部分计算。目前只有VocabParallelEmbedding和各种Linear层。
         # 把基础模型的对应层都替换成了lora层后，模型正常计算即可完成lora的计算。
@@ -212,7 +212,7 @@ class LoRAManager:
                 (module_name, self.set_lora_module(module_name, module))
             )
 
-    # lora内存池，里面包含A和B矩阵的内存分配。
+    # <NT> lora内存池，里面包含A和B矩阵的内存分配。
     # 各个目标模块里的A矩阵如大小一致者，会复用内存。B矩阵亦然。
     def init_lora_memory_pool(self):
         # preallocate lora memory pool
@@ -298,7 +298,7 @@ class LoRAManager:
                     if lora_weight_name:
                         self.B_buffer[lora_weight_name][i][buffer_id].copy_(weights)
 
-    # lora batch，即是多个lora模块组合而成的一个batch。因为每个lora模块里，针对相同的类型和层id，其权重维度都一样。
+    # <NT> lora batch，即是多个lora模块组合而成的一个batch。因为每个lora模块里，针对相同的类型和层id，其权重维度都一样。
     # 可以把这些权重放到一起使用segment_gemm来一起计算。
     # prepare_lora_batch是通过server_args.lora_paths判断调用的，但具体该batch是否需要计算lora，需要cur_uids不为空。
     # cur_uids首先由forward_batch.lora_paths指定，是通过 req.lora_path -> ScheduleBatch.get_model_worker_batch -> ModelWorkerBatch -> ForwardBatch得到的。
@@ -348,7 +348,7 @@ class LoRAManager:
         for module_name, module in self.lora_modules:
             layer_id = get_layer_id(module_name)
 
-            # ab buffer都是按lora模块，层类型，层id三个索引进行划分。对于同类型和同id，不同lora模块的数据可以一起算。
+            # <NT> ab buffer都是按lora模块，层类型，层id三个索引进行划分。对于同类型和同id，不同lora模块的数据可以一起算。
             # 如 self.A_buffer[lora_weight_name][i][buffer_id]， 里面的[buffer_id]会跟lora模块一一对应。
             # 所以计算时，seg_indptr分a矩阵，weight_indices分b矩阵。各自单独计算gemm。搜 self.segment_gemm = SegmentGEMMWrapper(workspace_buffer) 看参数定义
             if "qkv_proj" not in module_name:

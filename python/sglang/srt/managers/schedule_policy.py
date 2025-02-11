@@ -66,7 +66,7 @@ class CacheAgnosticPolicy(Enum):
     RANDOM = "random"
 
 
-# 调度策略
+# <NT> 调度策略
 class SchedulePolicy:
     Policy = Union[CacheAwarePolicy, CacheAgnosticPolicy]
 

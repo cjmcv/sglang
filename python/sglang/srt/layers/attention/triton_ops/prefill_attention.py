@@ -26,6 +26,7 @@ is_cuda_available = torch.cuda.is_available()
 if is_cuda_available:
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
+# <NT> 
 @triton.jit
 def _fwd_kernel(
     Q,
@@ -214,7 +215,7 @@ def _fwd_kernel(
         out_ptrs, acc, mask=(offs_m[:, None] < cur_batch_seq_len) & (mask_d[None, :])
     )
 
-
+# <NT> 
 def context_attention_fwd(
     q, k, v, o, b_start_loc, b_seq_len, max_input_len, is_causal=True
 ):

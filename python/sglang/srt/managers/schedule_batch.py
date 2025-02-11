@@ -732,6 +732,7 @@ class ScheduleBatch:
 
         assert len(self.out_cache_loc) == self.extend_num_tokens
 
+    # <NT> 
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
 
@@ -890,7 +891,7 @@ class ScheduleBatch:
 
         return False
 
-    # 当内存不足时，将正在decode的请求收回去，也把对应的cache都清除掉
+    # <NT> 当内存不足时，将正在decode的请求收回去，也把对应的cache都清除掉
     def retract_decode(self):
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = [i for i in range(len(self.reqs))]
@@ -970,6 +971,7 @@ class ScheduleBatch:
 
         return retracted_reqs, new_estimate_ratio
 
+    # <NT> 
     def check_for_jump_forward(self, pad_input_ids_func):
         jump_forward_reqs = []
         keep_indices = set(i for i in range(len(self.reqs))) # 当前请求数的标号
@@ -1078,7 +1080,7 @@ class ScheduleBatch:
             self.seq_lens.add_(1)
         self.seq_lens_sum += bs
 
-    # 将self.reqs中keep_indices对应下标元素保留，去掉其他元素；
+    # <NT> 将self.reqs中keep_indices对应下标元素保留，去掉其他元素；
     # 如果keep_indices未指定，则将self.reqs中已完成或已经被chunked的去掉。
     def filter_batch(
         self,
@@ -1161,7 +1163,7 @@ class ScheduleBatch:
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
 
-    # 区分batch里是否包含extend数据，如果是，需要提供extend相关信息。
+    # <NT> 区分batch里是否包含extend数据，如果是，需要提供extend相关信息。
     # ScheduleBatch里面包含的内容太多，不便全部带走，所以单独生成ModelWorkerBatch以供内层调用。
     # ModelWorkerBatch是个很纯粹的类，只有数据没有函数。
     def get_model_worker_batch(self):
