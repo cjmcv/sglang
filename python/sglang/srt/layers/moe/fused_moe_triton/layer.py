@@ -221,7 +221,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 class FusedMoE(torch.nn.Module):
     """FusedMoE layer for MoE models.
 
-    w1/w3是合并列并行的线性层, w2是行并行的线性层。
+    <NT> w1/w3是合并列并行的线性层, 由两个层合并成一个层做linear, 起到gate_up_proj的作用，TP并行需要使用MergedColumnParallel, 
+         w2是单一的线性层，接到w13的列并行后面，做行并行规约结果。基础实现看 moe_forward_native。
     This layer contains both MergedColumnParallel weights (gate_up_proj /
     w13) and RowParallelLinear weights (down_proj/ w2).
 

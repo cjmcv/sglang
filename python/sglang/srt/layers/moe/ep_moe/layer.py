@@ -76,6 +76,10 @@ class GroupedGemmRunner(torch.nn.Module):
                 weight_indices=weight_indices,
             )
         else:
+            # <NT> 分组矩阵乘，暂时只支持权重为列主序的情况，即可以内存连续地逐列处理B矩阵。
+            # 因为nn.Linear的权重格式是(out_features, in_features), 
+            # 正常GEMM中应该是A(batchs, in_features) * B(in_features, out_features) = Y(batchs, out_features)
+            # B矩阵与nn.Linear权重矩阵呈转置关系，即行优先的B矩阵等同于列优先的nn.Linear权重矩阵。
             assert weight_column_major == True
             c = grouped_gemm_triton(
                 a,
@@ -162,6 +166,9 @@ class EPMoE(torch.nn.Module):
             self.fp8_dtype = torch.float8_e4m3fn
             self.activation_scheme = quant_config.activation_scheme
 
+        # <NT> 用选中的方法申请空间和指定权重加载方式。
+        # 申请的空间包括 w13_weight, w13_weight_scale, w13_input_scale,
+        #                w2_weight, w2_weight_scale, w2_input_scale
         self.quant_method.create_weights(
             layer=self,
             num_experts_per_partition=self.num_experts_per_partition,
@@ -426,6 +433,8 @@ class UnquantizedEPMoEMethod(FusedMoEMethodBase, CustomOp):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        # (out_size, in_size) = (2*intermediate_size, hidden_size)
+        # 正常矩阵乘的B矩阵应该是要(in_size，out_size)，为行优先。所以目前的权重格式需要按列优先来充当B矩阵。
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
             torch.empty(
@@ -499,6 +508,7 @@ class UnquantizedEPMoEMethod(FusedMoEMethodBase, CustomOp):
 
 class Fp8EPMoEMethod(Fp8MoEMethod):
     """MoE method for FP8.
+    <NT> 支持静态量化的weight scale和动态/静态量化的activation scale.
     Supports loading FP8 checkpoints with static weight scale and
     dynamic/static activation scale.
 
@@ -527,14 +537,18 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
         if self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = torch.float8_e4m3fn
 
-        # <NT> 权重分为w1/w2/w3, 分别对应gate, up和down_proj，共同定义了专家网络的结构,
+        # <NT> 权重分为w1/w3和w2, w1和w3对应up_proj,w2对应down_proj，up_proj->act->down_proj共同定义了专家网络的结构,
         # 
         # 如下，w1和w3用一个三维矩阵放在一起[num_experts_per_partition, 2 * intermediate_size, hidden_size] => *size
         # torch.empty的默认layout是torch.strided，默认情况下，最后一维连续排布，从后往前step。
-        # w1和w3的维度都是[num_experts_per_partition, intermediate_size, hidden_size]
-        # w2的维度是      [num_experts_per_partition, hidden_size, intermediate_size]
+        # w1和w3的维度都是[num_experts_per_partition, out=intermediate_size, in=hidden_size], w1和w3会合并作为一个线性层的权重一起计算。
+        # w2的维度是      [num_experts_per_partition, out=hidden_size, in=intermediate_size]
         # 因为是EP专家并行，每个节点只需要加载自己所负责专家网络即可，即num_experts_per_partition，表示每个part负责的专家数量。
         # 
+        # 对于nn.Linear中权重维度是[out_features, in_features], 
+        # w13_weight对应输入是hidden_size, 输出size是2 * intermediate_size, intermediate_size大于hidden_size，升维度。
+        # w2_weight对应输入是intermediate_size，输出是hidden_size，降维。up_proj后会做SiluAndMul，会将2 * intermediate_size合成intermediate_size，参考moe_forward_native实现。
+        #
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
             torch.empty(
@@ -561,6 +575,8 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
         # WEIGHT_SCALES
+        # <NT> weight_scale是一个专家一个，w1w2w3都各一份。
+        #      input_scale也是一个专家一个，w1和w3的是相同的输入，公用一个，w2自己一个。
         # Allocate 2 scales for w1 and w3 respectively.
         w13_weight_scale = torch.nn.Parameter(
             torch.ones(num_experts_per_partition, 2, dtype=torch.float32),

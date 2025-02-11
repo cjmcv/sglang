@@ -157,6 +157,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             ),
             requires_grad=False,
         )
+        # <NT> nn.Linear的权重是(out_features, in_features), 一行in_features个元素在内存上连续。
         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
@@ -168,6 +169,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
+        # <NT> 相当于 return torch.matmul(x, layer.weight.t()) + bias。
+        # 对于该linear文件中实现的线性层，非量化实现最底层都是调用这个pytorch的linear实现。
         return F.linear(x, layer.weight, bias)
 
 
@@ -309,6 +312,14 @@ class ColumnParallelLinear(LinearBase):
     its second dimension as A = [A_1, ..., A_p].
 
     Args:
+        <NT> 注释说第一维是输入，第二维是输出。而nn.Linear中的是(out_features, in_features), 与之相反，需要注意。
+             所以这里切分是按矩阵A不做转置的正常矩阵乘法来算的，in_features是GEMM的K。
+             MQ: 但是在构建weight时数据是(out_features, in_features)的，什么时候做过转置了？
+             答: 加载前后都没做转置，可以简单理解成ColumnParallelLinear的列切分，实际是GEMM的列，nn.linear的行。对于实际的nn.Linear的权重实际上是行切分。
+                 换句话说ColumnParallelLinear是对out_features做切分，RowParallelLinear是对in_features做切分。
+                 具体例子看下面RowParallelLinear的weight_loader函数注释。
+                 另外对于nn.Linear权重充当gemm的B时，要么先转置，要么以B矩阵为列优先的方式进行。
+                 (out_features, in_features)标记为列优先，即相当于行优先的(in_features, out_features).
         input_size: first dimension of matrix A.
         output_size: second dimension of matrix A.
         bias: If true, add bias.
@@ -1210,6 +1221,15 @@ class RowParallelLinear(LinearBase):
             and not use_bitsandbytes_4bit
             and not self.use_presharded_weights
         ):
+            # <NT> loaded_weight.narrow(dim, start, length), dim是要切分的维度, start是在dim维度上开始切片的起始索引，length是dim维度上开始切片的长度。
+            # RowParallelLinear的按行切分是针对GEMM的B矩阵方式来按行切分的，即(in_features, out_features)的行，切分后每个设备得到(n, out_features)的数据。
+            # 也就是按输入维度方向进行切分，即切片维度是(in_features, out_features) -> (length, out_features)
+            # 
+            # input_dim是输入的维度下标，而nn.Linear的权重维度是(out_features, in_features)，与矩阵乘的相反，需要注意。
+            # 对于param_data(out_features, in_features)来说要切分输入维度，param_data.shape[input_dim]是这该设备会被分到的数据的输入维度，
+            # shard_size就是sub_in_features, start_idx按tp_rank分配，得到的维度是(out_features, sub_in_features).
+            # 
+            # 注意: RowParallelLinear行切分，指代GEMM中B矩阵的行，对应到nn.Linear的权重就是列切分。反之ColumnParallelLinear亦然。
             shard_size = param_data.shape[input_dim]
             start_idx = self.tp_rank * shard_size
             loaded_weight = loaded_weight.narrow(input_dim, start_idx, shard_size)
@@ -1244,6 +1264,8 @@ class RowParallelLinear(LinearBase):
             param.load_row_parallel_weight(loaded_weight)
 
     def forward(self, input_):
+        # <NT> 如果前面接的是ColumnParallelLinear，且执行的是默认不做all gather，则其结果已经是切分好的了，
+        # 否则需要调用split_tensor_along_last_dim，切分一下。
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1258,6 +1280,7 @@ class RowParallelLinear(LinearBase):
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
         output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+        # <NT> 默认需要规约，叠加汇总结果
         if self.reduce_results and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output_parallel)
         else:
