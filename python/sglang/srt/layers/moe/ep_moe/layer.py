@@ -80,6 +80,7 @@ class GroupedGemmRunner(torch.nn.Module):
             # 因为nn.Linear的权重格式是(out_features, in_features), 
             # 正常GEMM中应该是A(batchs, in_features) * B(in_features, out_features) = Y(batchs, out_features)
             # B矩阵与nn.Linear权重矩阵呈转置关系，即行优先的B矩阵等同于列优先的nn.Linear权重矩阵。
+            # seg_indptr是分段指针
             assert weight_column_major == True
             c = grouped_gemm_triton(
                 a,
@@ -97,9 +98,39 @@ class GroupedGemmRunner(torch.nn.Module):
 
 # <NT> ep的pr: https://github.com/sgl-project/sglang/pull/2203
 #      mla dp的pr: https://github.com/sgl-project/sglang/pull/1970
-# https://mp.weixin.qq.com/s/hRVpCFynybW37jogW9_BXA
+#      博客: https://mp.weixin.qq.com/s/hRVpCFynybW37jogW9_BXA
 # 专家并行的MoE实现方式，与fused_moe_triton里的FusedMoE相对应。（enable_ep_moe则用EPMoE, 否则使用FusedMoE）
 # 专家并行时，专家网络会分布在不同设备中。与fused_moe_triton中的FusedMoE是平级互替关系。
+#
+# num_experts: 专家总数
+# top_k: 每个token选择的专家数量
+# hidden_size: 隐藏层大小
+# intermediate_size: 中间层大小，通常大于hidden_size
+# params_dtype: 参数数据类型,默认为None使用系统默认类型
+# renormalize: 是否重新归一化,默认True
+# use_grouped_topk: 是否使用分组topk,默认False
+# num_expert_group: 专家组数量,仅在use_grouped_topk=True时使用
+# topk_group: 每组选择的专家数量,仅在use_grouped_topk=True时使用
+# quant_config: 量化配置，支持Fp8EPMoEMethod
+# tp_size: 张量并行大小（这里实质是专家并行大小，即总共有多少个设备）
+# prefix: 前缀 (这里没使用到)
+# correction_bias: 修正偏置, 用于对门控网路的输出进行调整后再选专家，用于biased_grouped_topk，与grouped_topk相对应
+# 
+# 通信问题: 
+#   原来的ep并行训练中，需要使用两次all2all，第一次是将数据路由到合适的专家，第二次是将专家结果收集并重新分配。
+# 第一次将数据路由到合适的专家，专家只会收到对应的数据，使用all2all精准定位分配。使用all gather通信量会更大。
+# 第二次收集专家结果，因为只有部分专家有结果，所以也使用all2all，而不用all gather，通信量会少一些。
+# 另外如某个token会在多个节点的某些专家上计算，最终是需要叠加专家结果。这里的叠加放到了all2all的数据汇总之后做。
+#   这里的使用是使用allreduce代替两次all2all，为什么？
+#   个人理解：这里每个节点都有所有输入数据，都会执行一遍门控网络去选择专家。都会有一份完整的专家选取结果和完整的输入数据。
+# 每个节点只有部分专家，会对自己管理的专家所需要负责的数据从这份完整的输入数据中提取和整理并计算。
+# 这样每个节点有n个专家关于m份数据的输出结果，然后多个节点的不同专家所负责的数据会有重叠，如一小份数据a，需要同时进入1，2，3节点的部分专家里进行计算。
+# 1，2，3节点里部分专家对于数据a的计算结果需要加权叠加，并且没有参与计算的专家输出部分会被设置成0，可以直接使用all reduce。all reduce后不需要再做叠加操作。
+#   
+#   两个all2all换成1个allreduce，
+# 第一个all2all的关键点在于原版ep训练时，门控网络不是每个节点都运行，需要all2all分发数据，而这里的ep并行，门控网络是每个节点都计算的，每个节点都拥有完整的数据。
+# 第二个all2all是一小份数据在多个节点上的某些专家的计算结果是需要整合的，但是整合方式可能会随训练变化多样（如加权叠加，最大值，均值等），所以训练方案里是做all2all之后，再进行特定需要的叠加。
+#             而这里ep并行，默认的叠加方式就是加权叠加，加权在各节点内先并行做，并且令未参与计算的部分会被设置成0，可以直接all reduce叠加。（这里的叠加方式就没得选了）
 class EPMoE(torch.nn.Module):
     """
     MoE Expert Parallel Impl
@@ -168,7 +199,7 @@ class EPMoE(torch.nn.Module):
 
         # <NT> 用选中的方法申请空间和指定权重加载方式。
         # 申请的空间包括 w13_weight, w13_weight_scale, w13_input_scale,
-        #                w2_weight, w2_weight_scale, w2_input_scale
+        #               w2_weight,  w2_weight_scale,  w2_input_scale
         self.quant_method.create_weights(
             layer=self,
             num_experts_per_partition=self.num_experts_per_partition,
@@ -189,7 +220,8 @@ class EPMoE(torch.nn.Module):
                 hidden_states.device, use_flashinfer=False  # TODO: use flashinfer
             )
         
-        # <NT> router_logits 是门控网路的输出，筛选出得到高分的专家网络。
+        # <NT> router_logits 是门控网路的输出，筛选出得到高分的专家网络, 
+        # 即每个token要使用的topk个专家对应的权重和id号
         topk_weights, topk_ids = select_experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
@@ -201,15 +233,19 @@ class EPMoE(torch.nn.Module):
             correction_bias=self.correction_bias,
         )
 
+        # <NT> 预处理topk id, 获取重排序信息
         reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
             topk_ids, self.num_experts
         )
 
+        # <NT> 准备gate_up_proj的输入.
         gateup_input = torch.empty(
             (int(hidden_states.shape[0] * self.top_k), hidden_states.shape[1]),
             device=hidden_states.device,
             dtype=self.fp8_dtype if self.use_fp8_w8a8 else hidden_states.dtype,
         )
+        # deepseek权重量化只支持静态，激活值量化支持静态和动态的。
+        # 如激活值采用动态, 需要每次推理都计算一次input的scale值。
         if self.activation_scheme == "dynamic":
             max_value = (
                 torch.max(hidden_states)
@@ -218,6 +254,8 @@ class EPMoE(torch.nn.Module):
             )
             self.w13_input_scale = max_value / torch.finfo(self.fp8_dtype).max
 
+        # <NT> 预重排序, 重新排列输入数据,将相同专家的数据分组在一起以便后续批量计算
+        # hidden_states是输入, gateup_input是输出, gateup_input会充当gate_up_proj的输入.
         # PreReorder
         pre_reorder_triton_kernel[(hidden_states.shape[0],)](
             hidden_states,
@@ -232,6 +270,7 @@ class EPMoE(torch.nn.Module):
             BLOCK_SIZE=512,
         )
 
+        # <NT> 获取当前rank的分段指针和权重索引
         seg_indptr_cur_rank = seg_indptr[self.start_expert_id : self.end_expert_id + 2]
         weight_indices_cur_rank = torch.arange(
             0,
@@ -239,6 +278,7 @@ class EPMoE(torch.nn.Module):
             device=hidden_states.device,
             dtype=torch.int64,
         )
+        # <NT> 分组矩阵乘，计算第一个线性层gate_up_proj (gate和up二合一)
         # GroupGemm-0
         gateup_output = torch.empty(
             gateup_input.shape[0],
@@ -283,6 +323,7 @@ class EPMoE(torch.nn.Module):
             BLOCK_SIZE=512,
         )
 
+        # <NT> 分组矩阵乘，计算第二个线性层down_proj
         # GroupGemm-1
         down_output = torch.empty(
             down_input.shape[0],
@@ -303,6 +344,8 @@ class EPMoE(torch.nn.Module):
             scale_b=self.w2_weight_scale,
         )
 
+        # <NT> 后重排序, 将各个专家的输出按原始token顺序重组,并根据专家权重进行加权组合得到最终输出
+        # 输入down_output, 输出output
         # PostReorder
         output = torch.empty_like(hidden_states)
         post_reorder_triton_kernel[(hidden_states.size(0),)](
@@ -319,8 +362,11 @@ class EPMoE(torch.nn.Module):
         )
         return output
 
-    # <NT> 生成映射表，里面指定了(param_name, weight_name, expert_id, shard_id)，会被充当weight_loader函数的参数
+    # <NT> 生成参数映射表，是一个元组, 里面指定了(param_name, weight_name, expert_id, shard_id)，会被充当weight_loader函数的参数
     # make_expert_params_mapping在models/DeepseekV2ForCausalLM.load_weights中调用，喂入到weight_loader中。
+    # ckpt_gate_proj_name: checkpoint中gate投影层的名称, 对应w1
+    # ckpt_down_proj_name: checkpoint中down投影层的名称, 对应w2
+    # ckpt_up_proj_name: checkpoint中up投影层的名称, 对应w3
     @classmethod
     def make_expert_params_mapping(
         cls,
@@ -537,7 +583,7 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
         if self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = torch.float8_e4m3fn
 
-        # <NT> 权重分为w1/w3和w2, w1和w3对应up_proj,w2对应down_proj，up_proj->act->down_proj共同定义了专家网络的结构,
+        # <NT> 权重分为w1/w3和w2, w1和w3对应gate_proj+up_proj=gate_up_proj,w2对应down_proj，up_proj->act->down_proj共同定义了专家网络的结构,
         # 
         # 如下，w1和w3用一个三维矩阵放在一起[num_experts_per_partition, 2 * intermediate_size, hidden_size] => *size
         # torch.empty的默认layout是torch.strided，默认情况下，最后一维连续排布，从后往前step。

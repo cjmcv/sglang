@@ -77,7 +77,8 @@ def moe_forward_native(
     # Ref code from https://huggingface.co/deepseek-ai/DeepSeek-V2/blob/e0828e3cc0a03408724b80c3cc92c8e072db8d01/modeling_deepseek.py#L589
     len_experts = layer.num_experts
 
-    # <NT> topk_ids.shape[0]是num_token, topk_ids.shape[1]是topk中的k，参考grouped_topk笔记
+    # <NT> 待细究?
+    # topk_ids.shape[0]是num_token, topk_ids.shape[1]是topk中的k，参考grouped_topk笔记
     # 用scatter_沿着维度1(第一个参数)，即列方向，在topk_ids对应位置填1(最后一个参数)，构建一个计数矩阵。
     # cnts，矩阵的每一行对应一个样本，每一列对应一个专家，矩阵元素表示该样本是否选择了对应的专家
     # cnts.sum，沿着第0维累加，行是每个token，列对应专家。0维累加得到每个专家的token数。某一token(行)选中的某个专家(列)，对应元素是1，没选中的是0.
@@ -94,10 +95,12 @@ def moe_forward_native(
 
     outputs = []
     start_idx = 0
+    # <NT> tokens_per_expert是一维列表，i是列表下标，也对应专家id；num_tokens是列表下标i对应的元素，表示该专家要负责的tokens数量。
     for i, num_tokens in enumerate(tokens_per_expert):
         end_idx = start_idx + num_tokens
         if num_tokens == 0:
             continue
+        # 选出对应专家负责的tokens和对应专家的权重
         tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
 
         layer_w13_weight = layer.w13_weight[i]

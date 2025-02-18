@@ -132,7 +132,7 @@ def _fwd_kernel(
     for start_n in range(0, cur_seq_len_prefix, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_seq_len_prefix
-        # cur_batch_req_idx：当前req在该batch下的行偏移量； stride_req_to_tokens_b: 一行的总列数？
+        # <NT> cur_batch_req_idx：当前req在该batch下的行偏移量； stride_req_to_tokens_b: 一行的总列数？
         # Req_to_tokens存放由req定位到tokens的索引，start_n + offs_n: 线程所负责的范围
         # 得到offs_b_loc_prefix是prefix的偏移量。进而基于该偏移量在Req_to_tokens中找到对应prefix在k_buffer中存放的位置。
         offs_b_loc_prefix = cur_batch_req_idx * stride_req_to_tokens_b + (
@@ -188,7 +188,7 @@ def _fwd_kernel(
 
         e_max = n_e_max
 
-    # 上面计算的是前缀部分，全部都属于历史数据，因此需要全计算。
+    # <NT> 上面计算的是前缀部分，全部都属于历史数据，因此需要全计算。
     # 而这里需要计算KV的扩展部分，这部分KV中会与Q的各个token在时序上有前后重叠关系。而因果模型中，需要屏蔽未来的数据，则只需要计算三角区域即可。、
     # n的范围从
     # stage 2: compute the trianlge part
