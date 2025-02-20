@@ -114,6 +114,11 @@ if supports_custom_op():
     def inplace_all_reduce_fake(tensor: torch.Tensor, group_name: str) -> None:
         return
 
+    # <NT> 将inplace_all_reduce函数注册到pytorch里，后续可通过torch.ops.sglang.inplace_all_reduce调用。
+    # 下面的outplace_all_reduce同理。
+    # inplace_all_reduce -> GroupCoordinator._all_reduce_in_place -> torch.distributed.all_reduce 或 pynccl_comm.all_reduce
+    # outplace_all_reduce -> GroupCoordinator._all_reduce_out_place -> CustomAllreduce.custom_all_reduce
+    # CustomAllreduce只在outplace_all_reduce中使用，在支持CustomAllreduce的情况下会优先使用outplace_all_reduce。
     direct_register_custom_op(
         op_name="inplace_all_reduce",
         op_func=inplace_all_reduce,
@@ -138,7 +143,9 @@ if supports_custom_op():
         fake_impl=outplace_all_reduce_fake,
     )
 
-
+# <NT> 充当PyTorch ProcessGroup的包装类，也是全局变量_TP张量并行组 和 _PP流水线并行组的类型, 内部会绑定一个指定的通信后端，如nccl，gloo等
+# 组协调器GroupCoordinator负责组内各进程之间的所有通信操作。
+# 它可以将通信 路由到特定的实现方式（例如，根据张量大小和 CUDA 图模式切换归约通信（AllReduce）的实现方式）
 class GroupCoordinator:
     """
     PyTorch ProcessGroup wrapper for a group of processes.
@@ -154,6 +161,7 @@ class GroupCoordinator:
     rank: int  # global rank
     ranks: List[int]  # global ranks in the group
     world_size: int  # size of the group
+    # <NT> local_rank 是单节点内的rank，rank_in_group是整个组的rank，整个组可能会包含多个节点。
     # difference between `local_rank` and `rank_in_group`:
     # if we have a group of size 4 across two nodes:
     # Process | Node | Rank | Local Rank | Rank in Group
@@ -953,7 +961,9 @@ def set_custom_all_reduce(enable: bool):
     global _ENABLE_CUSTOM_ALL_REDUCE
     _ENABLE_CUSTOM_ALL_REDUCE = enable
 
-
+# <NT> 初始化分布式环境
+# 基于torch.distributed做init_process_group。
+# 并设置ranks(rank总数), local_rank(本节点rank), backend(通信后端)记录到本节点全局变量_WORLD中。
 def init_distributed_environment(
     world_size: int = -1,
     rank: int = -1,
@@ -1000,7 +1010,16 @@ def init_distributed_environment(
             _WORLD.world_size == torch.distributed.get_world_size()
         ), "world group already initialized with a different world size"
 
-
+# <NT> 初始化模型并行组，包含张量并行和流水线并行。
+# 如8卡，张量并行为2，流水线并行为4，
+# 则 张量并行分组   [g0, g1], [g2, g3], [g4, g5], [g6, g7] 结果存在全局变量 _TP 中
+#    流水线并行分组 [g0, g2, g4, g6], [g1, g3, g5, g7]     结果存在全局变量 _PP 中
+# _TP 和 _PP 都是 GroupCoordinator 类型，区别在于 use_message_queue_broadcaster 在TP中是True，在PP中是False.
+# 即TP使用消息队列广播器而PP不使用。TP需要广播，无严格的发送接收顺序；PP是一对一，有严格的发送接收顺序。
+# 消息队列实现的广播器中，生产者将消息发送到消息队列中，而多个消费者可以同时从消息队列中获取相同的消息，从而实现了消息的广播。
+#
+# 注意：这里sglang的该函数的调用方在ModelRunner的init_torch_distributed中的
+#       pipeline_model_parallel_size参数默认未被设置，即不使用流水线并行。
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
@@ -1031,7 +1050,8 @@ def initialize_model_parallel(
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
     world_size: int = torch.distributed.get_world_size()
-    backend = backend or torch.distributed.get_backend(get_world_group().device_group)
+    # <NT> 在torch.distributed.init_process_group设置，cuda对应nccl，cpu对应gloo
+    backend = backend or torch.distributed.get_backend(get_world_group().device_group) 
 
     if world_size != tensor_model_parallel_size * pipeline_model_parallel_size:
         raise RuntimeError(
@@ -1040,6 +1060,8 @@ def initialize_model_parallel(
             f"pipeline_model_parallel_size ({pipeline_model_parallel_size})"
         )
 
+
+    # <NT> 张量并行组
     # Build the tensor model-parallel groups.
     num_tensor_model_parallel_groups: int = world_size // tensor_model_parallel_size
     global _TP
@@ -1060,6 +1082,7 @@ def initialize_model_parallel(
         group_name="tp",
     )
 
+    # <NT> 流水线并行组
     # Build the pipeline model-parallel groups.
     num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
     global _PP

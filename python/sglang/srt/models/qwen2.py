@@ -297,7 +297,10 @@ class Qwen2Model(nn.Module):
                     "Self attention has no KV cache scaling " "factor attribute!"
                 )
 
-
+# <NT> Qwen2×îÍâ²ãÀà
+# -> Qwen2Model
+# -> LogitsProcessor
+#    Pooler
 class Qwen2ForCausalLM(nn.Module):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [

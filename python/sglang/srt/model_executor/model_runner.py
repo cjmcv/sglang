@@ -216,8 +216,11 @@ class ModelRunner:
             self.cuda_graph_runner = None
             self.init_attention_backend()
 
+    # <NT> 初始化分布式环境
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
+        # <NT> 根据设备来设置通信后端，cuda使用nccl，cpu的使用gloo。
+        # 如果是异构的，可能需要基于nccl传输后再用cuda api拷贝到内存。
         # Init torch distributed
         torch.get_device_module(self.device).set_device(self.gpu_id)
         if self.device == "cuda":
@@ -231,6 +234,9 @@ class ModelRunner:
         elif self.device == "cpu":
             backend = "gloo"
 
+        # <NT> p2p即点对点传输，指的是不同 GPU 之间直接进行数据传输，无需通过CPU内存中转.
+        # 通过nvlink/pcie连接的显卡可以进行p2p通信，而通过TCP/IP或InfiniBand的网络通信的则不行。
+        # 使用猴子补丁，来关闭检查是否支持p2p。
         if not self.server_args.enable_p2p_check:
             monkey_patch_p2p_access_check()
 
@@ -242,6 +248,7 @@ class ModelRunner:
 
         if not self.is_draft_worker:
             # Only initialize the distributed environment on the target model worker.
+            # <NT> 初始化pytorch的process group，并记录本节点的rank等信息到全局变量_WORLD中。
             init_distributed_environment(
                 backend=backend,
                 world_size=self.tp_size,

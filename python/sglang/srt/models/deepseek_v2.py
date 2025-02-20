@@ -71,16 +71,7 @@ if is_flashinfer_available():
 #     其次，RowParallelLinear有参数input_is_parallel，即表示数据已经切分好了，可以直接在ColumnParallelLinear的结果上计算。
 #     反之，如果仍采用ColumnParallelLinear，它要求每个设备接收 完整的输入数据 进行计算，而前面的结果是已经将数据切分好了，要整合的话得多一次all gather通信才行。
 #     另外，输入维度是[intermediate_size] * 2，较大，占用的显存也会比较多。
-#
-# 例子分析：
-#  假设有输入[0,1], 权重[a,b]，计算结果应该是[0*a+1*c, 0*b+1*d]
-#           [2,3]，    [c,d]               [2*a+3*c, 2*b+3*d]
-#  ColumnParallelLinear如下所示，需要完整的输入数据。
-#     列切分时，设备0分到一列权重[a]，另外设备b分到权重[b]. a结果是[0*a+1*c], b结果是[0*b+1*d], all gather直接拼接即得到最终结果。
-#                              [c]                  [d]        [2*a+3*c]        [2*b+3*d]
-#  RowParallelLinear，令input_is_parallel=True时，即前面的列切分没做all gather，如下所示：
-#     设备a输入有[0], 设备b输入有[1], 设备a权重有[a,b], 设备b权重有[c,d], a的结果是[0*a, 0*b], b的结果是[1*c, 1*d], 需要all reduce叠加得到最终结果。
-#               [2]            [3]                                             [2*a, 2*b]          [3*c, 3*d],
+# 例子看srt/layers/linear.py, 层定义处。
 class DeepseekV2MLP(nn.Module):
     def __init__(
         self,
