@@ -391,7 +391,7 @@ def _get_and_verify_dtype(
 
     return torch_dtype
 
-
+# <NT> 只有下面列的几项不是生成式模型，其他的基本都是
 def is_generation_model(model_architectures: List[str], is_embedding: bool = False):
     # We have two ways to determine whether a model is a generative model.
     # 1. Check the model architectue
@@ -409,7 +409,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
     else:
         return not is_embedding
 
-
+# <NT> 下面也列了几个常见的多模态模型
 def is_multimodal_model(model_architectures: List[str]):
     if (
         "LlavaLlamaForCausalLM" in model_architectures
@@ -425,7 +425,9 @@ def is_multimodal_model(model_architectures: List[str]):
     else:
         return False
 
-
+# <NT> decoder-only：常用于自然语言生成任务，目的式生成连贯、有逻辑的文本。如常见的qwen/llama/gpt等NLP类模型，大多采用decoder-only架构。
+#      encoder-decoder：常用于序列到序列的转换任务，如机器翻译，文本摘要，语音识别等。
+#                     或多模态中，会对不同模态的数据进行编码
 def is_encoder_decoder_model(model_architectures: List[str]):
     return "MllamaForConditionalGeneration" in model_architectures
 

@@ -227,9 +227,11 @@ class ModelRunner:
             self.cuda_graph_runner = None
             self.init_attention_backend()
 
+    # <NT> 初始化分布式环境
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
-
+        # <NT> 根据设备来设置通信后端，cuda使用nccl，cpu的使用gloo。
+        # 如果是异构的，可能需要基于nccl传输后再用cuda api拷贝到内存。
         torch.get_device_module(self.device).set_device(self.gpu_id)
         if self.device == "cuda":
             backend = "nccl"
@@ -242,6 +244,9 @@ class ModelRunner:
         elif self.device == "cpu":
             backend = "gloo"
 
+        # <NT> p2p即点对点传输，指的是不同 GPU 之间直接进行数据传输，无需通过CPU内存中转.
+        # 通过nvlink/pcie连接的显卡可以进行p2p通信，而通过TCP/IP或InfiniBand的网络通信的则不行。
+        # 使用猴子补丁，来关闭检查是否支持p2p。
         if not self.server_args.enable_p2p_check:
             monkey_patch_p2p_access_check()
 
@@ -253,6 +258,7 @@ class ModelRunner:
 
         if not self.is_draft_worker:
             # Only initialize the distributed environment on the target model worker.
+            # <NT> 初始化pytorch的process group，并记录本节点的rank等信息到全局变量_WORLD中。
             init_distributed_environment(
                 backend=backend,
                 world_size=self.tp_size,
@@ -285,6 +291,9 @@ class ModelRunner:
 
         return min_per_gpu_memory
 
+    # <NT> 在ModelRunner的初始化时调用，关键函数是get_model，里面会获取模型实例，
+    # 模型实例初始化的时候会为其每层创建显存。所以末尾处会get_available_gpu_memory确认一下剩余显存。
+    # (如需要做offload，实例创建时就需要判断对应层的初始化权重应处于cpu还是gpu）
     def load_model(self):
         logger.info(
             f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
@@ -362,6 +371,13 @@ class ModelRunner:
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
+    # <NT> TpModelWorker.update_weights_from_disk (使用中更新模型权重的流程，一般情况下不调用，逻辑与上面的load_model接近)
+    #      -> ModelRunner.update_weights_from_disk 
+    #         -> get_model_loader  （在ModelRunner.__init__时, 有调用过loader.load_model来创建模型实例）
+    #         -> get_weight_iter    (通过loader加载模型文件到内存)
+    #         -> model_load_weights 
+    #            -> model.load_weights (将内存中的权重注入到模型实例里，<如做offload，将权重注入到模型实例时需要改动>)
+    #            -> quant_method.process_weights_after_loading (遍历模型里的每个需要做量化的module，对其权重进行预处理)
     def update_weights_from_disk(
         self, model_path: str, load_format: str
     ) -> tuple[bool, str]:
@@ -382,6 +398,7 @@ class ModelRunner:
         self.model_config.model_path = model_path
         load_config = LoadConfig(load_format=load_format)
 
+        # <NT> 目前只支持DefaultModelLoader。（在ModelRunner初始化的时候有调用loader.load_model来创建模型实例）
         # Only support vllm DefaultModelLoader for now
         loader = get_model_loader(load_config)
         if not isinstance(loader, DefaultModelLoader):
@@ -742,6 +759,7 @@ class ModelRunner:
 
         tic = time.time()
         logger.info("Capture cuda graph begin. This can take up to several minutes.")
+        # <NT> 把ModelRunner自身带进去，里面有加载好的模型和推理流程
         self.cuda_graph_runner = CudaGraphRunner(self)
         logger.info(f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f} s")
 
@@ -786,6 +804,7 @@ class ModelRunner:
             forward_batch.input_ids, forward_batch.positions, forward_batch
         )
 
+    # <NT> is_cuda_graph()中标记只有DECODE/TARGET_VERIFY/IDLE是跑cuda graph的，extend不跑cuda graph
     def forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
         if (
             forward_batch.forward_mode.is_cuda_graph()

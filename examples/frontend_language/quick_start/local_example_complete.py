@@ -52,7 +52,7 @@ def batch():
 
 
 if __name__ == "__main__":
-    runtime = sgl.Runtime(model_path="meta-llama/Llama-2-7b-chat-hf")
+    runtime = sgl.Runtime(model_path="/home/cjmcv/project/llm_models/Qwen/Qwen2___5-1___5B-Instruct")#, disable_cuda_graph=True
     sgl.set_default_backend(runtime)
 
     # Run a single request

@@ -136,7 +136,11 @@ class LinearMethodBase(QuantizeMethodBase):
         Expects create_weights to have been called before on the layer."""
         raise NotImplementedError
 
-
+# <NT> 分析将线性层offload的cpu的方案
+# cuda graph的捕获流中可以捕获cpu到gpu的拷贝，也可以捕获从gpu到cpu的拷贝，但必须设置成异步拷贝 non_blocking，异步是相对于cpu而言的，但会将其插入到当前cuda stream中。
+# 如果需要基于拷贝后的数据做cpu的计算，需要将cpu计算也插入到该cuda stream中，需要使用cudaLaunchHostFunc函数。
+# 另外如 self.input_cpu.copy_(x, non_blocking=True)， 其中x是gpu的tensor数据，注意不要写成x.cpu(), 因为x.cpu会涉及自身tensor的gpu到cpu的拷贝和内存创建，
+# 在cuda graph捕获流中，不允许有内存申请的操作，所有内存申请操作需要在捕获流外面进行。
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
 
@@ -158,6 +162,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             ),
             requires_grad=False,
         )
+        # <NT> nn.Linear的权重是(out_features, in_features), 一行in_features个元素在内存上连续。
         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
@@ -169,6 +174,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
+        # <NT> 相当于 return torch.matmul(x, layer.weight.t()) + bias。
+        # 对于该linear文件中实现的线性层，非量化实现最底层都是调用这个pytorch的linear实现。
         return F.linear(x, layer.weight, bias)
 
 
@@ -184,6 +191,7 @@ class LinearBase(torch.nn.Module):
         quant_config: Quantization configure.
     """
 
+    # <NT> quant_method由quant_config得到，quant_config会从模型定义层的时候传入
     def __init__(
         self,
         input_size: int,
@@ -210,7 +218,7 @@ class LinearBase(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
-
+# <NT> 就是无TP并行的普通线性层?
 class ReplicatedLinear(LinearBase):
     """Replicated linear layer.
 
@@ -292,7 +300,34 @@ class ReplicatedLinear(LinearBase):
         s += f", bias={self.bias is not None}"
         return s
 
+# <NT> 权重矩阵按列进行划分，这里依照普通矩阵乘法。
+# Pytorch里的nn.Linear和tf里的tf.keras.layers.Dense，即FC层，如果在外面调用权重Tensor进行gemm计算，是需要对权重做转置。
+# 这里的列切分针对的是普通矩阵乘法，按转置后的权重来切分的。
+# 注意！！！: RowParallelLinear行切分，指代GEMM中B矩阵的行，对应到nn.Linear的权重就是列切分。反之ColumnParallelLinear亦然。
+#
+# GEMM中，输入X的一行，需要和权重A的一列里，每个元素一一对应相乘并累加得到一个元素结果。
+# 这里权重A按列切分，则一个设备中X的一行和A的一列已经完成累加计算，得到一个点的最终结果，因此只需要将其他点的数据收集起来即可，即all gather。
+# 张量并行中，因为每个元素已经独立算完，进入后面的层也需要做TP，所以该算子默认不做all gather，即gather_output=False。
+# ColumnParallelLinear的每个节点的输入数据需要是完整的，如果输入较大，会比较占显存。
+#
+# 例子：
+#  假设有输入[0,1], 权重[a,b]，计算结果应该是[0*a+1*c, 0*b+1*d]
+#           [2,3]，    [c,d]               [2*a+3*c, 2*b+3*d]
+#  ColumnParallelLinear如下所示，需要完整的输入数据。
+#     列切分时，设备0分到一列权重[a]，另外设备b分到权重[b]. a结果是[0*a+1*c], b结果是[0*b+1*d], all gather直接拼接即得到最终结果。
+#                              [c]                  [d]        [2*a+3*c]        [2*b+3*d]
+#  RowParallelLinear，令input_is_parallel=True时，即前面的列切分没做all gather，如下所示：
+#     设备a输入有[0], 设备b输入有[1], 设备a权重有[a,b], 设备b权重有[c,d], a的结果是[0*a, 0*b], b的结果是[1*c, 1*d], 需要all reduce叠加得到最终结果。
+#               [2]            [3]                                             [2*a, 2*b]          [3*c, 3*d],
 
+# <NT> 注释说第一维是输入，第二维是输出。而nn.Linear中的是(out_features, in_features), 与之相反，需要注意。
+#      所以这里切分是按矩阵A不做转置的正常矩阵乘法来算的，in_features是GEMM的K。
+#      MQ: 但是在构建weight时数据是(out_features, in_features)的，什么时候做过转置了？
+#      答: 加载前后都没做转置，可以简单理解成ColumnParallelLinear的列切分，实际是GEMM的列，nn.linear的行。对于实际的nn.Linear的权重实际上是行切分。
+#          换句话说ColumnParallelLinear是对out_features做切分，RowParallelLinear是对in_features做切分。
+#          具体例子看下面RowParallelLinear的weight_loader函数注释。
+#          另外对于nn.Linear权重充当gemm的B时，要么先转置，要么以B矩阵为列优先的方式进行。
+#          (out_features, in_features)标记为列优先，即相当于行优先的(in_features, out_features).
 class ColumnParallelLinear(LinearBase):
     """Linear layer with column parallelism.
 
@@ -456,8 +491,10 @@ class ColumnParallelLinear(LinearBase):
         s += f", tp_size={self.tp_size}"
         s += f", gather_output={self.gather_output}"
         return s
-
-
+    
+# <NT> 将多个线性层的权重矩阵合并为一个更大的矩阵，再按列进行分割。
+# 合并的线性层处于平级，输入一样，无前后依赖关系。
+# 具体合并多少个，看output_sizes: List[int]，List有多少个元素就是合并多少个。
 class MergedColumnParallelLinear(ColumnParallelLinear):
     """Packed linear layers with column parallelism.
 
@@ -720,7 +757,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             use_presharded_weights=self.use_presharded_weights,
         )
 
-
+# <NT> 线性层(全连接层)，用于attention的QKV的线性变换。权重矩阵沿着输出维度拼接在一起，layer则沿着head维度并行。
+# 输出矩阵就是QKV的拼接矩阵。
 class QKVParallelLinear(ColumnParallelLinear):
     """Linear layers for the attention's QKV transformation.
 
@@ -806,6 +844,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             use_presharded_weights=self.use_presharded_weights,
         )
 
+    # <NT> 首地址是q，k的首地址是q往后偏移q的大小(self.num_heads * self.head_size), v的首地址是k往后偏移自己的大小(self.num_kv_heads * self.head_size)
     def _get_shard_offset_mapping(self, loaded_shard_id: str):
         shard_offset_mapping = {
             "q": 0,
@@ -815,6 +854,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         }
         return shard_offset_mapping.get(loaded_shard_id)
 
+    # <NT> 对于分组的attention(如GQA), num_heads会大于num_kv_heads，且是其倍数关系。其他不分组的attention，num_heads和num_kv_heads一般一致。
     def _get_shard_size_mapping(self, loaded_shard_id: str):
         shard_size_mapping = {
             "q": self.num_heads * self.head_size,
@@ -1098,7 +1138,72 @@ class QKVParallelLinear(ColumnParallelLinear):
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
-
+# <NT> 权重矩阵按行进行划分，不同的设备负责计算权重矩阵的不同行与输入的部分乘积。
+# 在线性层计算中，如果在外面按gemm来计算，需要对nn.Linear中的权重做转置。转置后的权重才会有输入X一行会和权重A一列，计算累加得到一个点。
+# 这里的行切分和列切分，针对的是转置后的权重A来说的，
+# 所以将A按行划分，则X一行和A一行计算得到的是一行点的中间结果，最终结果还需要将其他行计算的结果累加起来，所以需要all reduce。对比ColumnParallelLinear。
+# 张量并行中，因为每个元素都没有算完，后面的层要做TP，必须先将结果做all reduce汇总，才能继续算。所以该算子默认要做all reduce，即reduce_results=True。
+# input_is_parallel表示输入数据已经切分好了，可以前面层可以搭配ColumnParallelLinear使用。则ColumnParallelLinear不需要all gather，RowParallelLinear也不需要再切分输入数据。
+#
+# 创建时的参数input_size和output_size，则其A权重维度是[output_size, input_size], X输入维度是[batch_size, input_size], 
+# Y输出维度是[batch_size, output_size], 计算时需要将权重转置(直接调用pytorch计算时不需要)。
+#
+# 注意！！！: RowParallelLinear行切分，指代GEMM中B矩阵的行，对应到nn.Linear的权重就是列切分。反之ColumnParallelLinear亦然。
+#
+# 例子：
+#  假设有输入[ 0, 1, 2, 3], 权重[a,b,c,d]，计算结果应该是[ 0a+ 1e+ 2i+ 3m,  0b+ 1f+ 2j+ 3n,  0c+ 1g+ 2k+ 3o,  0d+ 1h+ 2l+ 3p]
+#           [ 4, 5, 6, 7]，    [e,f,g,h]               [ 4a+ 5e+ 6i+ 7m,  4b+ 5f+ 6j+ 7n,  4c+ 5g+ 6k+ 7o,  4d+ 5h+ 6l+ 7p]
+#           [ 8, 9,10,11]      [i,j,k,l]               [ 8a+ 9e+10i+11m,  8b+ 9f+10j+11n,  8c+ 9g+10k+11o,  8d+ 9h+10l+11p]
+#           [12,13,14,15]      [m,n,o,p]               [12a+13e+14i+15m, 12b+13f+14j+15n, 12c+13g+14k+15o, 12d+13h+14l+15p]
+#   
+#  ColumnParallelLinear如下所示，需要完整的输入数据。
+#     列切分时，设备0分到一列权重[a,b]，另外设备b分到权重[c,d]. a结果是[ 0a+ 1e+ 2i+ 3m,  0b+ 1f+ 2j+ 3n], b结果是[ 0c+ 1g+ 2k+ 3o,  0d+ 1h+ 2l+ 3p], all gather直接拼接即得到最终结果。
+#                              [e,f]                 [g,h]        [ 4a+ 5e+ 6i+ 7m,  4b+ 5f+ 6j+ 7n]         [ 4c+ 5g+ 6k+ 7o,  4d+ 5h+ 6l+ 7p]
+#                              [i,j]                 [k,l]        [ 8a+ 9e+10i+11m,  8b+ 9f+10j+11n]         [ 8c+ 9g+10k+11o,  8d+ 9h+10l+11p]
+#                              [m,n]                 [o,p]        [12a+13e+14i+15m, 12b+13f+14j+15n]         [12c+13g+14k+15o, 12d+13h+14l+15p]
+#
+#  RowParallelLinear，令input_is_parallel=True时，即前面的列切分没做all gather，做简化如下所示：
+#     设备a输入有[ 0, 1], 设备b输入有[ 2, 3], 设备a权重有[a,b,c,d], 设备b权重有[i,j,k,l], a的结果是[  0a+1e,   0b+1f,   0c+1g,   0d+1h], b的结果是[  2i+3m,   2j+3n,   2k+3o,   2l+3p], 需要all reduce叠加得到最终结果。
+#               [ 4, 5]            [ 6, 7]            [e,f,g,h]             [m,n,o,p]          [  4a+5e,   4b+5f,   4c+5g,   4d+5h]          [  6i+7m,   6j+7n,   6k+7o,   6l+7p],
+#               [ 8, 9]            [10,11]                                                     [  8a+9e,   8b+9f,   8c+9g,   8d+9h]          [10i+11m, 10j+11n, 10k+11o, 10l+11p]
+#               [12,13]            [14,15]                                                     [12a+13e, 12b+13f, 12c+13g, 12d+13h]          [14i+15m, 14j+15n, 14k+15o, 14l+15p]
+#
+# 
+## 思考问题，进一步拆分，阶段性进行通信，达到计算与通信overlap的目的。
+# 一，行并行线性层的每个节点的输入会有一个整个batch的数据的部分列，按上面RowParallelLinear例子分析，将输入按batch维度切分，将a切分成[0,1]和[ 8, 9], b切分成[2,3]和[10,11]。 
+#                                                                                                                        [4,5]  [12,13]        [6,,7]  [14,15]
+#   a0与a权重计算得到[  0a+1e,   0b+1f,   0c+1g,   0d+1h],  b1与b权重计算得到 [  2i+3m,   2j+3n,   2k+3o,   2l+3p],  allreduce得到 [ 0a+ 1e+ 2i+ 3m,  0b+ 1f+ 2j+ 3n,  0c+ 1g+ 2k+ 3o,  0d+ 1h+ 2l+ 3p]
+#                   [  4a+5e,   4b+5f,   4c+5g,   4d+5h]                    [  6i+7m,   6j+7n,   6k+7o,   6l+7p]                [ 4a+ 5e+ 6i+ 7m,  4b+ 5f+ 6j+ 7n,  4c+ 5g+ 6k+ 7o,  4d+ 5h+ 6l+ 7p]
+#   a1与啊权重计算得到 [ 8a+9e,   8b+9f,   8c+9g,   8d+9h]，。。。。同理allreduce得到下半段 [ 8a+ 9e+10i+11m,  8b+ 9f+10j+11n,  8c+ 9g+10k+11o,  8d+ 9h+10l+11p]
+#                    [12a+13e, 12b+13f, 12c+13g, 12d+13h]                               [12a+13e+14i+15m, 12b+13f+14j+15n, 12c+13g+14k+15o, 12d+13h+14l+15p]
+#   节点各自本地拼接得到最终结果。
+#   数据进一步切分后，输入数据变成了tensor列表，每个tensor与权重(不需要切分)按普通线性层计算，将结果做allreduce的同时计算下一个tensor。
+#
+# 二，如果batch_size很小，gemm会往访存密集型方向靠，计算效率会降低，所以batch_size本身较小的情况下不适宜继续切分。如果继续按列切分，是否可行？
+#   按上面RowParallelLinear例子分析，将输入按列维度切分，将a切分成 [0] 和 [1], b切分成 [2] 和 [3]。
+#                                                              [4]    [5]         [6]    [7]
+#                                                              [8]    [9]        [10]   [11]
+#                                                             [12]   [13]        [11]   [15]
+#   此时输入维度是[4,1]，权重维度是[2,4], 无法直接使用普通的矩阵乘法，需要进一步将权重行方向进一步切分得到2个[1,4]才行, a权重切分成[a,b,c,d]和[e,f,g,h], b权重有[i,j,k,l]和[m,n,o,p]。
+#   a0和a0权重计算得到[ 0a, 0b, 0c, 0d], b0和b0权重得到[ 2i, 2j, 2k, 2l], allreduce
+#                    [ 4a, 4b, 4c, 4d]               [ 6i, 6j, 6k, 6l]
+#                    [ 8a, 8b, 8c, 8d]               [10i,10j,10k,10l]
+#                    [12a,12b,12c,12d]               [11i,11j,11k,11l]
+#   a1和a1权重计算得到[ 1e, 1f, 1g, 1h] 。。。                          ，allreduce
+#                    [ 5e, 5f, 5g, 5h]
+#                    [ 9e, 9f, 9g, 9h]
+#                    [13e,13f,13g,13h]
+#   节点内各自再叠加一次。可以得到正确结果，但是allreduce的通信量增多，因为mk x kn = mn，通信量是mn，如果切分的维度是k，两次通信量都还是mn，通信量是原来的两倍，只能按维度m切分，m/2，一次通信量就是mn/2，两次通信量与不切分一致。
+#
+# 三，从n方向切权重是否可行？
+#     设备a输入有[ 0, 1], 设备b输入有[ 2, 3], 设备a权重有[a,b] [c,d], 设备b权重有[i,j][k,l],
+#               [ 4, 5]            [ 6, 7]            [e,f] [g,h]            [m,n][o,p],
+#               [ 8, 9]            [10,11]                                             
+#               [12,13]            [14,15]
+#     a与a0权重计算得到[  0a+1e,   0b+1f], b与b0权重计算得到[  2i+3m,   2j+3n], allreduce 得到结果的前两列。a与a1权重，以及b与b1权重计算，可以得到后两列。
+#                     [  4a+5e,   4b+5f]                  [  6i+7m,   6j+7n]
+#                     [  8a+9e,   8b+9f]                  [10i+11m, 10j+11n]
+#                     [12a+13e, 12b+13f]                  [14i+15m, 14j+15n]
 class RowParallelLinear(LinearBase):
     """Linear layer with row parallelism.
 
@@ -1213,6 +1318,15 @@ class RowParallelLinear(LinearBase):
             and not use_bitsandbytes_4bit
             and not self.use_presharded_weights
         ):
+            # <NT> loaded_weight.narrow(dim, start, length), dim是要切分的维度, start是在dim维度上开始切片的起始索引，length是dim维度上开始切片的长度。
+            # RowParallelLinear的按行切分是针对GEMM的B矩阵方式来按行切分的，即(in_features, out_features)的行，切分后每个设备得到(n, out_features)的数据。
+            # 也就是按输入维度方向进行切分，即切片维度是(in_features, out_features) -> (length, out_features)
+            # 
+            # input_dim是输入的维度下标，而nn.Linear的权重维度是(out_features, in_features)，与矩阵乘的相反，需要注意。
+            # 对于param_data(out_features, in_features)来说要切分输入维度，param_data.shape[input_dim]是这该设备会被分到的数据的输入维度，
+            # shard_size就是sub_in_features, start_idx按tp_rank分配，得到的维度是(out_features, sub_in_features).
+            # 
+            # 注意: RowParallelLinear行切分，指代GEMM中B矩阵的行，对应到nn.Linear的权重就是列切分。反之ColumnParallelLinear亦然。
             shard_size = param_data.shape[input_dim]
             start_idx = self.tp_rank * shard_size
             loaded_weight = loaded_weight.narrow(input_dim, start_idx, shard_size)
@@ -1247,6 +1361,8 @@ class RowParallelLinear(LinearBase):
             param.load_row_parallel_weight(loaded_weight)
 
     def forward(self, input_):
+        # <NT> 如果前面接的是ColumnParallelLinear，且执行的是默认不做all gather，则其结果已经是切分好的了，
+        # 否则需要调用split_tensor_along_last_dim，切分一下。
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1261,6 +1377,7 @@ class RowParallelLinear(LinearBase):
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
         output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+        # <NT> 默认需要规约，叠加汇总结果
         if self.reduce_results and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output_parallel)
         else:

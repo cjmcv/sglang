@@ -368,6 +368,17 @@ class TritonAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+
+    # <NT> 该函数会在(python/sglang/srt/models/qwen2.py#157 -> self.attn)里调用。
+    # self.attn是RadixAttention对象，在forward时，里面会根据forward_batch.forward_mode.is_decode()来确定调用forward_extend还是forward_decode。
+    # 输入参数的qkv由attention层之前的线性层计算输出的。其中的k和v的进入forwad时就会被添加到该ForwardBatch维护的kvcache buffer中 (set_kv_buffer)，每次调用都会被叠加。
+    # 
+    # forward_extend里，kernel输入新的k和v，同时还要将kvcache里的数据拿出来计算，同时输入进行计算。
+    #    extend的bacth里，数据同属于一个序列，对应的是同一份kvcache，从历史kvcache里拿出来的数据属于prefix，所有数据都是历史数据，需要单独先计算。
+    #                    然后还要跟新的kv计算，新的kv可能会包含未来数据，在因果模型里只需要计算三角区域即可。所以需要区分开两部分来计算。
+    # forward_decode里，k和v就只用从kvcache buffer里读出来的。
+    #    decode的batch里，数据来自多个不同的序列，每个序列会有各自的kvcache，里面需要将batch里的每一行(一个token)与其对应的kv矩阵(该序列所有历史kvcache)做gemv。
+    # （参考 https://flashinfer.ai/2024/02/02/introduce-flashinfer.html 中的图1，Append对应Extend）
     def forward_extend(
         self,
         q: torch.Tensor,

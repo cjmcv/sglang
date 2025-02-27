@@ -43,7 +43,7 @@ class TreeNode:
         self.key = None
         self.value = None
         self.lock_ref = 0
-        self.last_access_time = time.time()
+        self.last_access_time = time.time() # 时间标记，用于LRU淘汰策略
 
         self.hit_count = 0
         # indicating the node is loading KV cache from host
@@ -61,7 +61,9 @@ class TreeNode:
     @property
     def backuped(self):
         return self.host_value is not None
-
+	
+	# <NT> 魔术方法/双下方法, 表示小于。
+    # 当使用 < 运算符比较两个对象时，Python 会自动调用对象的__lt__方法来确定它们的大小关系。
     def __lt__(self, other: "TreeNode"):
         return self.last_access_time < other.last_access_time
 

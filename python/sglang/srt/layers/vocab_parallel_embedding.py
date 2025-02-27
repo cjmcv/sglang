@@ -170,7 +170,9 @@ def get_masked_input_and_mask(
     input_ = vocab_mask * (input_ - valid_offset)
     return input_, ~vocab_mask
 
-
+# <NT> Embedding层在词表维度上做并行化, 注意词表大小会被pad到可以被并行的GPU整除。
+# 为了支持多种加载方式, 我们确保添加了LoRA的Embedding层始终位于TP分片张量的末尾。
+# 换句话说, 我们分别对基础嵌入层和 LoRA 嵌入层进行分片 (二者均经过pad), 并将它们放置在同一个张量中。
 class VocabParallelEmbedding(torch.nn.Module):
     """Embedding parallelized in the vocabulary dimension.
 
@@ -498,7 +500,9 @@ class VocabParallelEmbedding(torch.nn.Module):
             s += f", tp_size={self.tp_size}"
         return s
 
-
+# <NT> LMHead(语言模型头, Language Model Head), 它是语言模型的最后一层，连接在 Transformer 编码器或解码器的输出之后，
+# 本质上是一个线性层（全连接层），用于将 Transformer 模型提取的特征映射到词汇表大小的维度上。
+# 经过LMHead，得到每个词汇表中单词对应的得分（logits），再通过 Softmax 函数将这些得分转换为概率分布，代表模型预测下一个单词是词汇表中每个单词的概率。
 class ParallelLMHead(VocabParallelEmbedding):
     """Parallelized LM head.
 
