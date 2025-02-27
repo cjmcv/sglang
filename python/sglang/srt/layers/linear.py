@@ -135,7 +135,11 @@ class LinearMethodBase(QuantizeMethodBase):
         Expects create_weights to have been called before on the layer."""
         raise NotImplementedError
 
-
+# <NT> 分析将线性层offload的cpu的方案
+# cuda graph的捕获流中可以捕获cpu到gpu的拷贝，也可以捕获从gpu到cpu的拷贝，但必须设置成异步拷贝 non_blocking，异步是相对于cpu而言的，但会将其插入到当前cuda stream中。
+# 如果需要基于拷贝后的数据做cpu的计算，需要将cpu计算也插入到该cuda stream中，需要使用cudaLaunchHostFunc函数。
+# 另外如 self.input_cpu.copy_(x, non_blocking=True)， 其中x是gpu的tensor数据，注意不要写成x.cpu(), 因为x.cpu会涉及自身tensor的gpu到cpu的拷贝和内存创建，
+# 在cuda graph捕获流中，不允许有内存申请的操作，所有内存申请操作需要在捕获流外面进行。
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
 
