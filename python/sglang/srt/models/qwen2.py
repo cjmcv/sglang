@@ -47,6 +47,7 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
 )
 from sglang.srt.utils import make_layers
+from sglang.ext import offload
 
 Qwen2Config = None
 
@@ -187,6 +188,10 @@ class Qwen2DecoderLayer(nn.Module):
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
         )
+        if (layer_id > 24):
+            offload.OFFLOAD2CPU = True
+        else:
+            offload.OFFLOAD2CPU = False
         self.mlp = Qwen2MLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -367,7 +372,10 @@ class Qwen2ForCausalLM(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
+        idx = 0
         for name, loaded_weight in weights:
+            print(idx, name)
+            idx += 1
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:

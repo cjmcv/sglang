@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter, UninitializedParameter
+from sglang.ext import offload
 
 from sglang.srt.distributed import (
     divide,
@@ -135,10 +136,12 @@ class LinearMethodBase(QuantizeMethodBase):
         Expects create_weights to have been called before on the layer."""
         raise NotImplementedError
 
-
+# <NT> cuda graph的捕获流中可以捕获cpu到gpu的拷贝，也可以捕获从gpu到cpu的拷贝，但必须设置成异步拷贝 non_blocking，异步是相对于cpu而言的，但会将其插入到当前cuda stream中。
+# 如果需要基于拷贝后的数据做cpu的计算，需要将cpu计算也插入到该cuda stream中，需要使用cudaLaunchHostFunc函数。
+# 另外如 self.input_cpu.copy_(x, non_blocking=True)， 其中x是gpu的tensor数据，注意不要写成x.cpu(), 因为x.cpu会涉及自身tensor的gpu到cpu的拷贝和内存创建，
+# 在cuda graph捕获流中，不允许有内存申请的操作，所有内存申请操作需要在捕获流外面进行。
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
-
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -149,14 +152,20 @@ class UnquantizedLinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        weight = Parameter(
-            torch.empty(
-                sum(output_partition_sizes),
-                input_size_per_partition,
-                dtype=params_dtype,
-            ),
-            requires_grad=False,
-        )
+        if (offload.OFFLOAD2CPU == False):
+            weight = Parameter(
+                torch.empty(
+                    sum(output_partition_sizes),
+                    input_size_per_partition,
+                    dtype=params_dtype,
+                ),
+                requires_grad=False,
+            )
+        else:
+            print("on cpu mode")
+            self.offload_linear = offload.Linear()
+            weight = self.offload_linear.create_weights(input_size_per_partition, output_partition_sizes, params_dtype)
+
         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
@@ -168,8 +177,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
-        return F.linear(x, layer.weight, bias)
+        if hasattr(self, 'offload_linear'):
+            return self.offload_linear.apply(x, layer.weight, bias)
 
+        return F.linear(x, layer.weight, bias)
 
 class LinearBase(torch.nn.Module):
     """Base linear layer.
@@ -315,7 +326,6 @@ class ColumnParallelLinear(LinearBase):
         prefix: The name of the layer in the state dict, including all parents
                         (e.g. model.layers.0.qkv_proj)
     """
-
     def __init__(
         self,
         input_size: int,
@@ -1101,7 +1111,6 @@ class RowParallelLinear(LinearBase):
         params_dtype: Data type for the parameters.
         quant_config: Quantization configure.
     """
-
     def __init__(
         self,
         input_size: int,
