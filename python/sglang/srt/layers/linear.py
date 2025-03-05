@@ -161,7 +161,6 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 requires_grad=False,
             )
         else:
-            print("on cpu mode")
             self.offload_linear = offload.Linear()
             weight = self.offload_linear.create_weights(input_size_per_partition, output_partition_sizes, params_dtype)
         
@@ -380,9 +379,15 @@ class ColumnParallelLinear(LinearBase):
             ),
         )
         if bias:
-            self.bias = Parameter(
-                torch.empty(self.output_size_per_partition, dtype=params_dtype)
-            )
+            if (offload.OFFLOAD2CPU == True):
+                print("self.bias set:", offload.OFFLOAD2CPU)
+                self.bias = Parameter(
+                    torch.empty(self.output_size_per_partition, dtype=params_dtype, device=torch.device('cpu'))
+                )
+            else:
+                self.bias = Parameter(
+                    torch.empty(self.output_size_per_partition, dtype=params_dtype)
+                )
             set_weight_attrs(
                 self.bias,
                 {
@@ -1186,6 +1191,11 @@ class RowParallelLinear(LinearBase):
             )
 
         if bias:
+            if (offload.OFFLOAD2CPU == True):
+                self.bias = Parameter(torch.empty(self.output_size, dtype=params_dtype, device=torch.device('cpu')))
+            else:
+                self.bias = Parameter(torch.empty(self.output_size, dtype=params_dtype))
+        
             self.bias = Parameter(torch.empty(self.output_size, dtype=params_dtype))
             set_weight_attrs(
                 self.bias,

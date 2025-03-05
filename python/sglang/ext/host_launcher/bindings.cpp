@@ -38,16 +38,16 @@ public:
         int qlen;
         const void *input;
         const void *weight;
+        const void *bias;
         void *output;
     };
     static void inner(void *args) {
         Args *args_ = (Args *)args;
-        args_->linear->forward(args_->qlen, args_->input, args_->weight, args_->output);
+        args_->linear->forward(args_->qlen, args_->input, args_->weight, args_->bias, args_->output);
     }
     static std::pair<intptr_t, intptr_t>
-    warp4launch(Linear &linear, int qlen, intptr_t input, intptr_t weight, intptr_t output) {
-        Args *args = new Args{nullptr, &linear, qlen, (const void *)input, (const void *)weight,
-                              (void *)output};
+    warp4launch(Linear &linear, int qlen, intptr_t input, intptr_t weight, intptr_t bias, intptr_t output) {
+        Args *args = new Args{nullptr, &linear, qlen, (const void *)input, (const void *)weight, (const void *)bias, (void *)output};
         return std::make_pair((intptr_t)&inner, (intptr_t)args);
     }
 };
@@ -66,5 +66,6 @@ PYBIND11_MODULE(host_launcher, m) {
         }));
     py::class_<Linear>(linear_module, "Linear")
         .def(py::init<LinearConfig>())  // The input parameter type of this constructor is LinearConfig.
-        .def("forward", &LinearBindings::warp4launch);
+        .def("forward", &LinearBindings::warp4launch)
+        .def("forward_pure", &Linear::forward_pure);
 }

@@ -1,12 +1,43 @@
 cmake_minimum_required(VERSION 3.10)
 
+# 依赖：
+# cuda
+# pybind11：pip install pybind11
+# avx-512: set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx512f -mavx512bw -mavx512bf16")
+# c++11：为避免/usr/local的libstdc++.so.6与conda的版本不一致，指定到conda的lib路径里编译。
+
+# *oneapi: https://www.intel.cn/content/www/cn/zh/developer/tools/oneapi/base-toolkit-download.html?packages=oneapi-toolkit&oneapi-toolkit-os=linux&oneapi-lin=apt
+## set(CMAKE_PREFIX_PATH "/opt/intel/oneapi/mkl/latest/lib/cmake/mkl;${CMAKE_PREFIX_PATH}")
+## find_package(MKL CONFIG REQUIRED)
+## target_link_libraries(${PROJECT_NAME} PRIVATE pybind11::module cudart MKL::MKL)
+# *openmp: set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fopenmp")
+# note: oneapi和openmp在cuda graph里无法使用？可能跟线程的创建和释放有关？
+
+
 # 设置项目名称
 project(host_launcher)
 set(PROJECT_NAME host_launcher)
 
-set(PYTHON_INCLUDE /home/cjmcv/anaconda3/envs/venv2/include/python3.10)
-set(PYBIND11_INCLUDE /home/cjmcv/anaconda3/envs/venv2/lib/python3.10/site-packages/pybind11/include)
-set(pybind11_DIR /home/cjmcv/anaconda3/envs/venv2/lib/python3.10/site-packages/pybind11/share/cmake/pybind11)
+# set(CMAKE_CXX_STANDARD 11)
+link_directories(/home/cjmcv/anaconda3/envs/venv/lib)
+set(PYTHON_INCLUDE /home/cjmcv/anaconda3/envs/venv/include/python3.11)
+set(PYBIND11_INCLUDE /home/cjmcv/anaconda3/envs/venv/lib/python3.11/site-packages/pybind11/include)
+set(pybind11_DIR /home/cjmcv/anaconda3/envs/venv/lib/python3.11/site-packages/pybind11/share/cmake/pybind11)
+
+option(ENABLE_AVX512 "Enable AVX512" ON)
+
+if(ENABLE_AVX512)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx512f -mavx512bw -mavx512bf16 -lstdc++")
+    add_definitions(-DENABLE_AVX512)
+endif()
+
+# if(ENABLE_OPENMP)
+#     find_package(OpenMP)
+#     add_definitions(-DENABLE_OPENMP)
+# endif()
+
+
+
 find_package(pybind11 REQUIRED)
 find_package(CUDA ${CUDA_VERSION} REQUIRED EXACT)
 

@@ -53,6 +53,7 @@ Qwen2Config = None
 
 
 class Qwen2MLP(nn.Module):
+    # MLP_CNT = 0
     def __init__(
         self,
         hidden_size: int,
@@ -61,18 +62,27 @@ class Qwen2MLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
+        
+        # Qwen2MLP.MLP_CNT += 1
+        # if (Qwen2MLP.MLP_CNT > 10):
+        #     offload.OFFLOAD2CPU = True
+        #     offload.OFFLOAD2CPU_DATAMODE = 1
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
         )
+        # if (Qwen2MLP.MLP_CNT > 10):
+        #     offload.OFFLOAD2CPU_DATAMODE = 2
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
             quant_config=quant_config,
         )
+        # if (Qwen2MLP.MLP_CNT > 10):
+        #     offload.OFFLOAD2CPU = False
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. "
@@ -88,6 +98,7 @@ class Qwen2MLP(nn.Module):
 
 
 class Qwen2Attention(nn.Module):
+    ATTENTION_CNT = 0
     def __init__(
         self,
         hidden_size: int,
@@ -122,6 +133,10 @@ class Qwen2Attention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
+        Qwen2Attention.ATTENTION_CNT += 1
+
+        offload.OFFLOAD2CPU = True
+        offload.OFFLOAD2CPU_DATAMODE = 1
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
@@ -130,12 +145,14 @@ class Qwen2Attention(nn.Module):
             bias=True,
             quant_config=quant_config,
         )
+        offload.OFFLOAD2CPU_DATAMODE = 2
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
             quant_config=quant_config,
         )
+        offload.OFFLOAD2CPU = False
 
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -188,10 +205,7 @@ class Qwen2DecoderLayer(nn.Module):
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
         )
-        if (layer_id > 24):
-            offload.OFFLOAD2CPU = True
-        else:
-            offload.OFFLOAD2CPU = False
+
         self.mlp = Qwen2MLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
