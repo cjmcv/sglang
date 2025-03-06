@@ -379,8 +379,7 @@ class ColumnParallelLinear(LinearBase):
             ),
         )
         if bias:
-            if (offload.OFFLOAD2CPU == True):
-                print("self.bias set:", offload.OFFLOAD2CPU)
+            if (offload.OFFLOAD2CPU == True): # offload
                 self.bias = Parameter(
                     torch.empty(self.output_size_per_partition, dtype=params_dtype, device=torch.device('cpu'))
                 )
@@ -1191,7 +1190,7 @@ class RowParallelLinear(LinearBase):
             )
 
         if bias:
-            if (offload.OFFLOAD2CPU == True):
+            if (offload.OFFLOAD2CPU == True): # offload
                 self.bias = Parameter(torch.empty(self.output_size, dtype=params_dtype, device=torch.device('cpu')))
             else:
                 self.bias = Parameter(torch.empty(self.output_size, dtype=params_dtype))

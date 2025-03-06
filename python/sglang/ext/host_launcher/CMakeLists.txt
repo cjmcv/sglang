@@ -19,10 +19,15 @@ project(host_launcher)
 set(PROJECT_NAME host_launcher)
 
 # set(CMAKE_CXX_STANDARD 11)
-link_directories(/home/cjmcv/anaconda3/envs/venv/lib)
-set(PYTHON_INCLUDE /home/cjmcv/anaconda3/envs/venv/include/python3.11)
-set(PYBIND11_INCLUDE /home/cjmcv/anaconda3/envs/venv/lib/python3.11/site-packages/pybind11/include)
-set(pybind11_DIR /home/cjmcv/anaconda3/envs/venv/lib/python3.11/site-packages/pybind11/share/cmake/pybind11)
+set(CONDA_ENV /home/cjmcv/anaconda3/envs/venv/)
+
+set(PYTHON_INCLUDE ${CONDA_ENV}/include/python3.11)
+set(PYBIND11_INCLUDE ${CONDA_ENV}/lib/python3.11/site-packages/pybind11/include)
+set(pybind11_DIR ${CONDA_ENV}/lib/python3.11/site-packages/pybind11/share/cmake/pybind11)
+link_directories(${CONDA_ENV}/lib)
+
+# include_directories(${CONDA_ENV}/lib/python3.11/site-packages/nvidia/cuda_runtime/include)
+# link_directories(${CONDA_ENV}/lib/python3.11/site-packages/nvidia/cuda_runtime/lib)
 
 option(ENABLE_AVX512 "Enable AVX512" ON)
 
@@ -35,8 +40,6 @@ endif()
 #     find_package(OpenMP)
 #     add_definitions(-DENABLE_OPENMP)
 # endif()
-
-
 
 find_package(pybind11 REQUIRED)
 find_package(CUDA ${CUDA_VERSION} REQUIRED EXACT)

@@ -4,7 +4,7 @@ python3 local_example_complete.py
 """
 
 import sglang as sgl
-
+import time
 
 @sgl.function
 def few_shot_qa(s, question):
@@ -52,19 +52,22 @@ def batch():
 
 
 if __name__ == "__main__":
-    runtime = sgl.Runtime(model_path="/home/cjmcv/project/llm_models/Qwen/Qwen2___5-1___5B-Instruct")#, disable_cuda_graph=True
+    runtime = sgl.Runtime(model_path="/home/cjmcv/project/llm_models/Qwen/Qwen2___5-1___5B-Instruct") #, disable_cuda_graph=True
     sgl.set_default_backend(runtime)
 
     # Run a single request
     print("\n========== single ==========\n")
+    tic = time.time()
     single()
-
+    print(time.time() - tic, "s")
     # Stream output
     print("\n========== stream ==========\n")
+    tic = time.time()
     stream()
-
+    print(time.time() - tic, "s")
     # Run a batch of requests
     print("\n========== batch ==========\n")
+    tic = time.time()
     batch()
-
+    print(time.time() - tic, "s")
     runtime.shutdown()

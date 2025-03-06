@@ -53,7 +53,7 @@ Qwen2Config = None
 
 
 class Qwen2MLP(nn.Module):
-    # MLP_CNT = 0
+    MLP_CNT = 0
     def __init__(
         self,
         hidden_size: int,
@@ -63,25 +63,28 @@ class Qwen2MLP(nn.Module):
     ) -> None:
         super().__init__()
         
-        # Qwen2MLP.MLP_CNT += 1
-        # if (Qwen2MLP.MLP_CNT > 10):
-        #     offload.OFFLOAD2CPU = True
-        #     offload.OFFLOAD2CPU_DATAMODE = 1
+        start_cnt = 8
+        Qwen2MLP.MLP_CNT += 1
+        # if (Qwen2MLP.MLP_CNT > start_cnt):
+        #     offload.OFFLOAD2CPU = False ##
+        #     offload.OFFLOAD2CPU_DATAMODE = 0
+
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
         )
-        # if (Qwen2MLP.MLP_CNT > 10):
-        #     offload.OFFLOAD2CPU_DATAMODE = 2
+        # if (Qwen2MLP.MLP_CNT > start_cnt):
+        #     offload.OFFLOAD2CPU_DATAMODE = 0
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
             quant_config=quant_config,
         )
-        # if (Qwen2MLP.MLP_CNT > 10):
+        # if (Qwen2MLP.MLP_CNT > start_cnt):
+        #     offload.OFFLOAD2CPU_DATAMODE = 0
         #     offload.OFFLOAD2CPU = False
         if hidden_act != "silu":
             raise ValueError(
@@ -92,7 +95,7 @@ class Qwen2MLP(nn.Module):
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        x = self.act_fn(gate_up) # forward_native 不能直接用cpu计算，还需要将其放到stream中才行，否则cuda graph的数据会乱
         x, _ = self.down_proj(x)
         return x
 
@@ -133,10 +136,10 @@ class Qwen2Attention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
-        Qwen2Attention.ATTENTION_CNT += 1
+        # Qwen2Attention.ATTENTION_CNT += 1
 
         offload.OFFLOAD2CPU = True
-        offload.OFFLOAD2CPU_DATAMODE = 1
+        offload.OFFLOAD2CPU_DATAMODE = 0
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
@@ -145,7 +148,7 @@ class Qwen2Attention(nn.Module):
             bias=True,
             quant_config=quant_config,
         )
-        offload.OFFLOAD2CPU_DATAMODE = 2
+        # offload.OFFLOAD2CPU_DATAMODE = 0
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,

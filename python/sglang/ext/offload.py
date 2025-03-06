@@ -105,17 +105,20 @@ class Linear():
             # 0:GIGO, 1:GICO, 2:CIGO, 3:CICO 
             idx = x.shape[0] - 1
             print("apply cpu", idx, "stream", torch.cuda.current_stream().cuda_stream)
-            self.inputs_cpu[idx].copy_(x, non_blocking=True)
+            if (self.data_mode == 0 or self.data_mode == 1):
+                self.inputs_cpu[idx].copy_(x, non_blocking=True)
+                input = self.inputs_cpu[idx]
+            else:
+                input = x
             #######################################################
-            M = self.inputs_cpu[idx].shape[0]
             bias_ptr = 0
             if (bias != None):
                 bias_ptr = bias.data_ptr()
             Linear.HOST_LAUNCHER.submit_with_cuda_stream(
                 torch.cuda.current_stream().cuda_stream,
                 self.linear.forward(
-                    M,
-                    self.inputs_cpu[idx].data_ptr(), 
+                    input.shape[0],
+                    input.data_ptr(), 
                     weight.data_ptr(),
                     bias_ptr,
                     self.outputs_cpu[idx].data_ptr()
@@ -123,8 +126,11 @@ class Linear():
             )
             #######################################################
             # print("output", self.outputs_cpu[idx])
-            self.outputs_gpu[idx].copy_(self.outputs_cpu[idx], non_blocking=True)
-            return self.outputs_gpu[idx]
+            if (self.data_mode == 0 or self.data_mode == 2):
+                self.outputs_gpu[idx].copy_(self.outputs_cpu[idx], non_blocking=True)
+                return self.outputs_gpu[idx]
+            else:
+                return self.outputs_cpu[idx]
         else:
             # # torch.set_printoptions(threshold=torch.inf)
             # idx = x.shape[0] - 1
@@ -156,7 +162,8 @@ class Linear():
                 output_cpu = F.linear(x.to("cpu"), weight, bias.to("cpu"))
             else:
                 output_cpu = F.linear(x.to("cpu"), weight, None)
-            outputs_gpu = output_cpu.to("cuda")
 
-            return outputs_gpu
-    
+            if (self.data_mode == 0 or self.data_mode == 2):
+                return output_cpu.to("cuda")
+            else:
+                return output_cpu
