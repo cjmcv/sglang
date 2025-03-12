@@ -151,19 +151,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        if (offload.OFFLOAD2CPU == False):
-            weight = Parameter(
-                torch.empty(
-                    sum(output_partition_sizes),
-                    input_size_per_partition,
-                    dtype=params_dtype,
-                ),
-                requires_grad=False,
-            )
-        else:
-            self.offload_linear = offload.Linear()
-            weight = self.offload_linear.create_weights(input_size_per_partition, output_partition_sizes, params_dtype)
-        
+        weight = Parameter(
+            torch.empty(
+                sum(output_partition_sizes),
+                input_size_per_partition,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        # <NT> nn.Linear的权重是(out_features, in_features), 一行in_features个元素在内存上连续。
         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
@@ -174,11 +170,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        
-        if hasattr(self, 'offload_linear'):
-            return self.offload_linear.apply(x, layer.weight, bias)
 
+        # <NT> 相当于 return torch.matmul(x, layer.weight.t()) + bias。
+        # 对于该linear文件中实现的线性层，非量化实现最底层都是调用这个pytorch的linear实现。
         return F.linear(x, layer.weight, bias)
+
 
 class LinearBase(torch.nn.Module):
     """Base linear layer.
@@ -211,7 +207,7 @@ class LinearBase(torch.nn.Module):
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype
         if quant_config is None:
-            self.quant_method: Optional[QuantizeMethodBase] = UnquantizedLinearMethod()
+            self.quant_method: Optional[QuantizeMethodBase] = UnquantizedLinearMethod() if (offload.OFFLOAD2CPU is False) else offload.UnquantizedCpuLinearMethod()
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
 
@@ -379,7 +375,7 @@ class ColumnParallelLinear(LinearBase):
             ),
         )
         if bias:
-            if (offload.OFFLOAD2CPU == True): # offload
+            if (isinstance(self.quant_method, offload.UnquantizedCpuLinearMethod) == True): # offload
                 self.bias = Parameter(
                     torch.empty(self.output_size_per_partition, dtype=params_dtype, device=torch.device('cpu'))
                 )
@@ -1190,7 +1186,7 @@ class RowParallelLinear(LinearBase):
             )
 
         if bias:
-            if (offload.OFFLOAD2CPU == True): # offload
+            if (isinstance(self.quant_method, offload.UnquantizedCpuLinearMethod) == True):
                 self.bias = Parameter(torch.empty(self.output_size, dtype=params_dtype, device=torch.device('cpu')))
             else:
                 self.bias = Parameter(torch.empty(self.output_size, dtype=params_dtype))

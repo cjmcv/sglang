@@ -65,10 +65,9 @@ class Qwen2MLP(nn.Module):
         
         start_cnt = 8
         Qwen2MLP.MLP_CNT += 1
-        # if (Qwen2MLP.MLP_CNT > start_cnt):
-        #     offload.OFFLOAD2CPU = False ##
-        #     offload.OFFLOAD2CPU_DATAMODE = 0
-
+        if (Qwen2MLP.MLP_CNT > start_cnt):
+            offload.OFFLOAD2CPU = True ##
+            offload.OFFLOAD2CPU_DATAMODE = 0
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -83,9 +82,9 @@ class Qwen2MLP(nn.Module):
             bias=False,
             quant_config=quant_config,
         )
-        # if (Qwen2MLP.MLP_CNT > start_cnt):
-        #     offload.OFFLOAD2CPU_DATAMODE = 0
-        #     offload.OFFLOAD2CPU = False
+        if (Qwen2MLP.MLP_CNT > start_cnt):
+            offload.OFFLOAD2CPU_DATAMODE = 0
+            offload.OFFLOAD2CPU = False
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. "

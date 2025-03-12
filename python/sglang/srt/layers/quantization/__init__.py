@@ -29,6 +29,8 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 
+import sglang.ext.offload 
+
 QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "aqlm": AQLMConfig,
     "awq": AWQConfig,
@@ -60,7 +62,7 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
         )
     return QUANTIZATION_METHODS[quantization]
 
-
+# <NT> gptq的线性层LinearBase 和 FusedMoE 都将使用vllm里面实现的marlin方案
 def gptq_get_quant_method(self, layer, prefix):
     from vllm.model_executor.layers.quantization.gptq_marlin import (
         GPTQMarlinLinearMethod,
@@ -76,7 +78,7 @@ def gptq_get_quant_method(self, layer, prefix):
         return GPTQMarlinMoEMethod(self)
     return None
 
-
+# <NT> awq的线性层LinearBase/ParallelLMHead 和 FusedMoE 都将使用vllm里面实现的marlin方案
 def awq_get_quant_method(self, layer, prefix):
     from vllm.model_executor.layers.quantization.awq import is_layer_skipped_awq
     from vllm.model_executor.layers.quantization.awq_marlin import (
@@ -149,7 +151,11 @@ def patch_vllm_linear_base_isinstance():
 
     builtins.isinstance = patched_isinstance
 
-
+# <NT> 量化实现方案中对gptq和awq的猴子补丁。
+# 如 GPTQMarlinConfig 中本身有 get_quant_method 函数，而GPTQMarlinConfig是vllm里面的实现，
+# 这里想要用自己的实现去 gptq_get_quant_method 去更换里面原有的get_quant_method。
+# 后续通过 GPTQMarlinConfig.get_quant_method 就可以调用到 gptq_get_quant_method。
+# gguf格式的猴子补丁是在ModelRunner.load_model时调用的monkey_patch_vllm_gguf_config，可能是因为用的少，不在初始化时强制执行？
 def apply_monkey_patches():
     """Apply all monkey patches in one place."""
     from vllm.model_executor.layers.quantization.awq_marlin import AWQMoEMethod

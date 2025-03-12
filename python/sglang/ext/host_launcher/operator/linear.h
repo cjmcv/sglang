@@ -1,14 +1,6 @@
-/**
- * @Description  :
- * @Author       : chenht2022
- * @Date         : 2024-07-12 10:07:58
- * @Version      : 1.0.0
- * @LastEditors  : chenht2022
- * @LastEditTime : 2024-07-25 10:35:00
- * @Copyright (c) 2024 by KVCache.AI, All Rights Reserved.
- **/
-#ifndef CPUINFER_OPERATOR_LINEAR_H
-#define CPUINFER_OPERATOR_LINEAR_H
+
+#ifndef OFFLOAD_LINEAR_H
+#define OFFLOAD_LINEAR_H
 
 #include <cmath>
 #include <cstdio>
@@ -42,4 +34,4 @@ private:
     pai::thread::ThreadPool thread_pool_;
 };
 
-#endif
+#endif // OFFLOAD_LINEAR_H

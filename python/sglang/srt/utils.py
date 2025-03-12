@@ -529,7 +529,9 @@ def monkey_patch_p2p_access_check():
 
     setattr(CustomAllreduce, "__del__", lambda *args, **kwargs: None)
 
-
+# <NT> 针对gguf格式的猴子补丁，将量化方法的标准实现改成gguf的专属实现。
+# LinearBase             -> GGUFLinearMethod
+# VocabParallelEmbedding -> GGUFEmbeddingMethod
 def monkey_patch_vllm_gguf_config():
     from vllm.model_executor.layers.quantization.gguf import (
         GGUFConfig,

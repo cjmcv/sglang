@@ -185,6 +185,7 @@ class ModelRunner:
         set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
 
         # Get memory before model loading
+        # <NT> 加载模型前的剩余显存，单位是GB
         min_per_gpu_memory = self.init_torch_distributed()
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -795,8 +796,10 @@ class ModelRunner:
             return self.cuda_graph_runner.replay(forward_batch)
 
         if forward_batch.forward_mode.is_decode():
+            print("forward decode")
             return self.forward_decode(forward_batch)
         elif forward_batch.forward_mode.is_extend():
+            print("forward extend")
             return self.forward_extend(forward_batch)
         elif forward_batch.forward_mode.is_idle():
             return self.forward_idle(forward_batch)

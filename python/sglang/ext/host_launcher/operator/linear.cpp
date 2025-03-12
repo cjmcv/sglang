@@ -39,13 +39,13 @@ void GemmBf16TbSplitN(int M, int N, int N_start, int N_end, int K, const bf16* A
     for (int i = 0; i < M; ++i) {
         for (int j = N_start; j < N_end; j++) {
             __m512 sum = _mm512_setzero_ps();
-            for (int k = 0; k < K-31; k+=32) {     // 一次32个16位=512位
+            for (k = 0; k < K-31; k+=32) {     // 一次32个16位=512位
                 __m512i ai = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(A + i * K + k));  // 按内存读取，不管类型
                 __m512bh a_bh = reinterpret_cast<__m512bh>(ai);                                    // 类型强转
                 __m512i bi = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(B + j * K + k));
                 __m512bh b_bh = reinterpret_cast<__m512bh>(bi);
 
-                sum = _mm512_dpbf16_ps(sum, a_bh, b_bh);  // 32个bf16的点积运算，a_bh和b_bh点积，得到16个fp32，与16个fp32的sum相加。
+                sum = _mm512_dpbf16_ps(sum, a_bh, b_bh);  // 32个bf16的点积运算，a_bh和b_bh点积，得到16个fp32，与16个fp32的sum相加。cat /proc/cpuinfo 需要有 avx512_bf16的才支持
             }
             // float *sum_ptr = (float*)&sum;
             // float sum2 = sum_ptr[0] + sum_ptr[1] + sum_ptr[2] + sum_ptr[3] + sum_ptr[4] + sum_ptr[5] + sum_ptr[6] + sum_ptr[7] + 
@@ -77,7 +77,7 @@ void GemmBf16Tb(int M, int N, int K, const bf16* A, const bf16* B, const bf16* b
 
 void Linear::forward(int qlen, const void* input, const void* weight, const void* bias, void* output) {
     // printf("Linear::forward: %d, %d, %d.\n", qlen, config_.input_size, config_.output_size);
-
+    printf("c");
     bf16 *A = (bf16 *)input;
     const bf16 *B = (const bf16 *)weight;
     const bf16 *bias_bf = (const bf16 *)bias;
