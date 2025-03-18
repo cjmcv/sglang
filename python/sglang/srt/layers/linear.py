@@ -211,6 +211,10 @@ class LinearBase(torch.nn.Module):
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
 
+            from vllm.model_executor.layers.quantization.gptq_marlin import GPTQMarlinLinearMethod
+            if (offload.OFFLOAD2CPU is True and isinstance(self.quant_method, GPTQMarlinLinearMethod)):
+                self.quant_method = offload.GPTQCpuLinearMethod(quant_config)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
@@ -533,7 +537,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: Optional[int] = None,
     ):
-
+        # <NT> GGUF专用的权重加载部分
         # Special case for GGUF
         # initialize GGUF param after we know the quantize type
         is_gguf_weight = getattr(param, "is_gguf_weight", False)
@@ -557,6 +561,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 self.qweight = param.materialize_nested()
             return
 
+        # <NT> 除了GGUF以外的权重加载部分
         param_data = param.data
         output_dim = getattr(param, "output_dim", None)
         # Special case for AQLM codebooks.
@@ -586,8 +591,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 # If quantized, we need to adjust the offset and size to account
                 # for the packing.
                 if packed_dim == output_dim:
-                    shard_size = shard_size // param.pack_factor
-                    shard_offset = shard_offset // param.pack_factor
+                    shard_size = shard_size // 8#param.pack_factor
+                    shard_offset = shard_offset // 8#param.pack_factor
                     # Special case for Marlin.
                     shard_size, shard_offset = adjust_marlin_shard(
                         param, shard_size, shard_offset
@@ -608,8 +613,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             # for the packing.
             packed_dim = getattr(param, "packed_dim", None)
             if packed_dim == output_dim:
-                shard_size = shard_size // param.pack_factor
-                shard_offset = shard_offset // param.pack_factor
+                shard_size = shard_size // 8 #param.pack_factor
+                shard_offset = shard_offset // 8 #param.pack_factor
                 # Special case for Marlin.
                 shard_size, shard_offset = adjust_marlin_shard(
                     param, shard_size, shard_offset
@@ -987,8 +992,8 @@ class QKVParallelLinear(ColumnParallelLinear):
                 # If quantized, we need to adjust the offset and size to account
                 # for the packing.
                 if packed_dim == output_dim:
-                    shard_size = shard_size // param.pack_factor
-                    shard_offset = shard_offset // param.pack_factor
+                    shard_size = shard_size // param.packed_factor
+                    shard_offset = shard_offset // 8#param.pack_factor
 
                     # Special case for Marlin.
                     shard_size, shard_offset = adjust_marlin_shard(
@@ -1043,8 +1048,8 @@ class QKVParallelLinear(ColumnParallelLinear):
             # for the packing.
             packed_dim = getattr(param, "packed_dim", None)
             if packed_dim == output_dim:
-                shard_size = shard_size // param.pack_factor
-                shard_offset = shard_offset // param.pack_factor
+                shard_size = shard_size // 8 #param.pack_factor
+                shard_offset = shard_offset // 8 #param.pack_factor
 
                 # Special case for Marlin.
                 shard_size, shard_offset = adjust_marlin_shard(

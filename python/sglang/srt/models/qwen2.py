@@ -65,26 +65,24 @@ class Qwen2MLP(nn.Module):
         
         start_cnt = 8
         Qwen2MLP.MLP_CNT += 1
-        if (Qwen2MLP.MLP_CNT > start_cnt):
-            offload.OFFLOAD2CPU = True ##
-            offload.OFFLOAD2CPU_DATAMODE = 0
+        offload.OFFLOAD2CPU = False
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
         )
-        # if (Qwen2MLP.MLP_CNT > start_cnt):
-        #     offload.OFFLOAD2CPU_DATAMODE = 0
+        offload.OFFLOAD2CPU = False
+
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
             quant_config=quant_config,
         )
-        if (Qwen2MLP.MLP_CNT > start_cnt):
-            offload.OFFLOAD2CPU_DATAMODE = 0
-            offload.OFFLOAD2CPU = False
+        # if (Qwen2MLP.MLP_CNT == start_cnt):
+        #     offload.OFFLOAD2CPU_DATAMODE = 0
+        offload.OFFLOAD2CPU = False
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. "
@@ -135,10 +133,9 @@ class Qwen2Attention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
-        # Qwen2Attention.ATTENTION_CNT += 1
+        Qwen2Attention.ATTENTION_CNT += 1
 
         offload.OFFLOAD2CPU = True
-        offload.OFFLOAD2CPU_DATAMODE = 0
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
@@ -147,7 +144,8 @@ class Qwen2Attention(nn.Module):
             bias=True,
             quant_config=quant_config,
         )
-        # offload.OFFLOAD2CPU_DATAMODE = 0
+        # if (Qwen2Attention.ATTENTION_CNT >= 2 and  Qwen2Attention.ATTENTION_CNT <=10):
+        # if (Qwen2Attention.ATTENTION_CNT == 10):
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -373,6 +371,7 @@ class Qwen2ForCausalLM(nn.Module):
         get_embedding: bool = False,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        # print("hidden_states type:", hidden_states.dtype)
         if not get_embedding:
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch

@@ -104,7 +104,7 @@ class ModelRunner:
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
-
+        
         # Model-specific adjustment
         if (
             self.model_config.attention_arch == AttentionArch.MLA
@@ -796,10 +796,10 @@ class ModelRunner:
             return self.cuda_graph_runner.replay(forward_batch)
 
         if forward_batch.forward_mode.is_decode():
-            print("forward decode")
+            # print("forward decode")
             return self.forward_decode(forward_batch)
         elif forward_batch.forward_mode.is_extend():
-            print("forward extend")
+            # print("forward extend")
             return self.forward_extend(forward_batch)
         elif forward_batch.forward_mode.is_idle():
             return self.forward_idle(forward_batch)

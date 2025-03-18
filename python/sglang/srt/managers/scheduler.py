@@ -131,6 +131,7 @@ class Scheduler:
         tp_rank: int,
         dp_rank: Optional[int],
     ):
+        print("Scheduler init")
         # Parse args
         self.server_args = server_args
         self.tp_rank = tp_rank

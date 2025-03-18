@@ -29,7 +29,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 
-import sglang.ext.offload 
+from sglang.ext import offload 
 
 QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "aqlm": AQLMConfig,
@@ -74,6 +74,8 @@ def gptq_get_quant_method(self, layer, prefix):
 
     if isinstance(layer, LinearBase):
         return GPTQMarlinLinearMethod(self)
+    # if isinstance(layer, LinearBase):
+    #     return offload.GPTQMarlinCpuLinearMethod(self)
     elif isinstance(layer, FusedMoE):
         return GPTQMarlinMoEMethod(self)
     return None
@@ -151,6 +153,16 @@ def patch_vllm_linear_base_isinstance():
 
     builtins.isinstance = patched_isinstance
 
+
+def gptq_cpu_get_quant_method(self, layer: torch.nn.Module, prefix: str):
+    from sglang.srt.layers.linear import LinearBase
+    from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
+    if (isinstance(layer, LinearBase) or
+        (isinstance(layer, ParallelLMHead) and self.lm_head_quantized)):
+        return offload.GPTQCpuLinearMethod(self)
+    return None
+
 # <NT> 量化实现方案中对gptq和awq的猴子补丁。
 # 如 GPTQMarlinConfig 中本身有 get_quant_method 函数，而GPTQMarlinConfig是vllm里面的实现，
 # 这里想要用自己的实现去 gptq_get_quant_method 去更换里面原有的get_quant_method。
@@ -163,6 +175,8 @@ def apply_monkey_patches():
     setattr(GPTQMarlinConfig, "get_quant_method", gptq_get_quant_method)
     setattr(AWQMarlinConfig, "get_quant_method", awq_get_quant_method)
     setattr(AWQMoEMethod, "apply", awq_moe_method_apply)
+    # # offload
+    # setattr(GPTQConfig, "get_quant_method", gptq_cpu_get_quant_method)
 
 
 patch_vllm_linear_base_isinstance()
