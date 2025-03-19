@@ -50,7 +50,7 @@ def download_from_hf(model_path: str):
 
     return snapshot_download(model_path, allow_patterns=["*.json", "*.bin", "*.model"])
 
-
+# <NT> 从模型文件夹中读取配置文件config.json并添加一些其他信息。
 def get_config(
     model: str,
     trust_remote_code: bool,

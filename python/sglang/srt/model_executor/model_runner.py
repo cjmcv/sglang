@@ -185,6 +185,7 @@ class ModelRunner:
         set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
 
         # Get memory before model loading
+        # <NT> 加载模型前的剩余显存，单位是GB
         min_per_gpu_memory = self.init_torch_distributed()
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -398,7 +399,8 @@ class ModelRunner:
         self.model_config.model_path = model_path
         load_config = LoadConfig(load_format=load_format)
 
-        # <NT> 目前只支持DefaultModelLoader。（在ModelRunner初始化的时候有调用loader.load_model来创建模型实例）
+        # <NT> 根据load_config获得特定加载器，如GGUFModelLoader和常用的DefaultModelLoader。
+        #      在ModelRunner初始化的时候也有调用loader.load_model来创建模型实例
         # Only support vllm DefaultModelLoader for now
         loader = get_model_loader(load_config)
         if not isinstance(loader, DefaultModelLoader):

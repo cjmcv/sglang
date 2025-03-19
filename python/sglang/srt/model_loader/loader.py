@@ -1163,6 +1163,8 @@ class GGUFModelLoader(BaseModelLoader):
         # hack: ggufs have a different name than transformers
         if model_type == "cohere":
             model_type = "command-r"
+        # <NT> 找到模型对应架构，如value是qwen2和deepseek2，需和model_type一致。key是MODEL_ARCH.QWEN2: 17 / MODEL_ARCH.QWEN2: 17
+        # 进而得到name_map, gguf有自己的命名规则，需要用这个map将huggingface的名字转变为gguf的名字。
         arch = None
         for key, value in gguf.MODEL_ARCH_NAMES.items():
             if value == model_type:
@@ -1176,6 +1178,7 @@ class GGUFModelLoader(BaseModelLoader):
             dummy_model = AutoModelForCausalLM.from_config(config)
         state_dict = dummy_model.state_dict()
 
+        # <NT> 将hugging的名字转为gguf的名字
         gguf_to_hf_name_map = {}
         for hf_name in state_dict:
             name, suffix = hf_name.rsplit(".", 1)

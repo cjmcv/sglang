@@ -113,12 +113,28 @@ class TpModelWorkerClient:
             logger.error(f"TpModelWorkerClient hit an exception: {traceback}")
             self.parent_process.send_signal(signal.SIGQUIT)
 
+    # <NT> cpu schedule 和 gpu compute overlap
+    # 参考：https://zhuanlan.zhihu.com/p/17744625577
+    # 普通模式：准备batch1 -> launch和计算batch1 -> 得到batch1生成的token1 -> 准备新的batch2 -> launch和计算batch2.
+    # overlap模式：核心是future_token_ids, 表示当前在计算的batch的结果将会存放的位置（仅仅是地址索引，而不是实际内容）。
+    #             准备batch需要较多cpu操作，但在下一次kernel实际计算时才需要知道要计算的token的实际内容，
+    #             在准备batch阶段并不需要知道，只需要基于对用地址进行准备即可。
+    #             
+    #             self.future_token_ids_map: 维护维护实际生成的next_token_ids。
+    #             future_token_ids_ct：一个batch的next_token_ids在map的偏移量，该偏移量会每个batch递增。
+    #
+    #             如batch1在启动计算的同时准备batch2的数据，正常流程是需要拿到batch1的结果next_token_ids去组建batch2的。
+    #             这里则直接用future_token_ids_ct在map中划定一块区域，以该区域充当batch1的结果next_token_ids，完成batch2的组建，并launch batch2计算。
+    #             batch1计算完成后，会有一个拷贝操作，将batch1的next_token_ids拷贝到map之前组batch2时划定的区域上进行填充。因为batch1计算 / 拷贝更新 / batch2计算
+    #             都是gpu操作，都在cuda stream中完成，也就是会按顺序执行的。所以batch2计算时，batch2的输入会真正准备好。
+    # 
     @torch.no_grad()
     def forward_thread_func_(self):
         batch_pt = 0
         batch_lists = [None] * 2
 
         while True:
+            # <NT> 从input_queue中拿到future_token的地址索引号在map中的偏移量，该偏移量会每个batch递增。
             model_worker_batch, future_token_ids_ct = self.input_queue.get()
             if not model_worker_batch:
                 break
@@ -143,6 +159,9 @@ class TpModelWorkerClient:
                 model_worker_batch, self.launch_done
             )
 
+            # <NT> 当前batch1计算完，将输出下标更新到map的future_token_ids_ct偏移区域中，
+            # 该区域已经被下一个batch2充当输入token_ids并launch kernel了。
+            # batch1计算/map填充拷贝/batch2计算在cuda stream中排序，所以batch2在计算时，map肯定完成了填充，即输入数据能真正准备好。
             # Update the future token ids map
             bs = len(model_worker_batch.seq_lens)
             self.future_token_ids_map[
@@ -165,6 +184,7 @@ class TpModelWorkerClient:
             next_token_ids = next_token_ids.to("cpu", non_blocking=True)
             copy_done.record()
 
+            # <NT> next_token_ids是真实输出的id号，用于取词后处理。
             self.output_queue.put((copy_done, logits_output, next_token_ids))
 
     def resolve_batch_result(self, bid: int):
@@ -197,7 +217,8 @@ class TpModelWorkerClient:
         # A cuda stream sync here to avoid the cuda illegal memory access error.
         self.scheduler_stream.synchronize()
 
-        # <NT> 推送数据到input_queue中，在forward_thread中会while(True)循环获取input_queue的数据进行推计算(forward_thread_func_)
+		# <NT> 基于future_token_ids_ct号(表示未来输出token_id存放位置的内容偏移量)，去启动下一个batch的kernel。
+        #      推送数据到input_queue中，在forward_thread中会while(True)循环获取input_queue的数据进行推计算(forward_thread_func_)
         # Push a new batch to the queue
         self.input_queue.put((model_worker_batch, self.future_token_ids_ct))
 
@@ -210,6 +231,7 @@ class TpModelWorkerClient:
             dtype=torch.int32,
             device=self.device,
         )
+        # <NT> 随batch按batch_size大小递增。
         self.future_token_ids_ct = (
             self.future_token_ids_ct + bs
         ) % self.future_token_ids_limit
