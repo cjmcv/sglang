@@ -52,8 +52,8 @@ def batch():
 
 
 if __name__ == "__main__":
-    # runtime = sgl.Runtime(model_path="/home/cjmcv/project/llm_models/Qwen/Qwen2___5-1___5B-Instruct") #, quantization='gptq'
-    runtime = sgl.Runtime(model_path="/home/cjmcv/project/llm_models/Qwen/Qwen2___5-1___5b-Instruct-GPTQ-Int4") #, disable_cuda_graph=True
+    runtime = sgl.Runtime(model_path="/home/cjmcv/project/llm_models/Qwen/Qwen2___5-1___5B-Instruct") #, quantization='gptq'
+    # runtime = sgl.Runtime(model_path="/home/cjmcv/project/llm_models/Qwen/Qwen2___5-1___5b-Instruct-GPTQ-Int4") #, disable_cuda_graph=True
     # runtime = sgl.Runtime(model_path="/home/cjmcv/project/llm_models/Qwen/Qwen2___5-1___5B-Instruct-AWQ")
     # runtime = sgl.Runtime(model_path="/home/cjmcv/project/llm_models/Qwen/Qwen2___5-1___5b-instruct-GGUF/qwen2.5-1.5b-instruct-q4_k_m.gguf", disable_cuda_graph=True)
     

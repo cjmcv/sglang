@@ -16,14 +16,6 @@
 # https://github.com/vllm-project/vllm/blob/fb6af8bc086328ca6659e72d11ffd4309ce4de22/vllm/model_executor/models/deepseek_v2.py
 """Inference-only DeepseekV2 model."""
 
-# <NT> huggingface的模型会由configuration_deepseek.py和modeling_deepseek.py两个文件组成，
-# configuration_deepseek.py：包含各种超参数和设置信息，这些信息决定了模型的架构、规模和行为。通过配置类，用户可以方便地对模型进行定制和调整；
-#                            https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/configuration_deepseek.py
-# modeling_deepseek.py：实现 DeepSeek 模型的具体架构和前向传播逻辑。它定义了模型的各个组件，如嵌入层、注意力层、前馈网络等，并将这些组件组合成完整的模型；
-#                       https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/modeling_deepseek.py
-# 如在ktransformer的实现，是在huggingface模型定义的基础上，将其中某些算子更换成自己的，从而达到优化的效果。
-# 当前的sglang模型文件主要对应上面modeling_deepseek.py。
-
 import os
 from typing import Any, Dict, Iterable, Optional, Tuple
 

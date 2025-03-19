@@ -227,3 +227,5 @@ compile_commands.json
 .vscode
 
 1
+
+cmake/

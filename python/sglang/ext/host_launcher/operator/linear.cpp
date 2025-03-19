@@ -12,7 +12,7 @@ Linear::Linear(LinearConfig config) {
     config_ = config;
     flag_ = 1;
 
-    num_thread_ = 16;
+    num_thread_ = 8;
     thread_pool_.CreateThreads(num_thread_);
 
     table_f32_f16_ = nullptr;
@@ -327,9 +327,6 @@ void Linear::ForwardW4A16WithFp32(int M, int N, int K, const void* input, const 
     const float *B = (const float *)weight;
     fp16 *C = (fp16 *)output;
     
-    // int M = qlen;
-    // int N = config_.output_size;
-    // int K = config_.input_size;
 #ifdef ENABLE_AVX512
     if (At_len_ < M * K) {
         At_len_ = M * K;
@@ -386,7 +383,7 @@ void Linear::forward(int M, int N, int K, const void* input, const void* weight,
         return ForwardW4A16WithFp32(M,N,K, input, weight, bias, output);
 
     // printf("Linear::forward: %d, %d, %d.\n", qlen, config_.input_size, config_.output_size);
-    printf("c");
+    // printf("c");
     bf16 *A = (bf16 *)input;
     const bf16 *B = (const bf16 *)weight;
     const bf16 *bias_bf = (const bf16 *)bias;

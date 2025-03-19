@@ -60,7 +60,6 @@ class ModelConfig:
         self.hf_text_config = get_hf_text_config(self.hf_config)
 
         # Check model type
-        # <NT> 确认模型类型，下面几个函数都是列了一些目前支持的模型，通过查看当前模型是否在列表里面来进行判断。
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding
         )
@@ -144,13 +143,10 @@ class ModelConfig:
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.vocab_size = self.hf_text_config.vocab_size
 
-        # <NT> 确认启用的量化方案，如gptq/gptq_marlin/awq等
         # Verify quantization
         self._verify_quantization()
 
         # Cache attributes
-        # <NT> eos_token_id (End-of-Sequence), 当生成的 token 对应的 id 是 eos_token_id 时，
-        # 就意味着文本生成过程结束。模型会停止继续生成新的 token，将已经生成的文本作为最终结果输出.
         self.hf_eos_token_id = self.get_hf_eos_token_id()
         self.image_token_id = getattr(self.hf_config, "image_token_id", None)
 
@@ -220,7 +216,6 @@ class ModelConfig:
             quant_cfg = getattr(self.hf_config, "compression_config", None)
         return quant_cfg
 
-    # <NT> 确认启用的量化方案，此时self.quantization可以为空，即用户未显式指定。
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _verify_quantization(self) -> None:
         supported_quantization = [*QUANTIZATION_METHODS]
@@ -254,15 +249,10 @@ class ModelConfig:
         # Parse quantization method from the HF model config, if available.
         quant_cfg = self._parse_quant_hf_config()
 
-        # <NT> 如gptq模型，这里quant_method就会得到“gptq”字串，
         if quant_cfg is not None:
             quant_method = quant_cfg.get("quant_method", "").lower()
 
             # Detect which checkpoint is it
-            # <NT> 如gptq模型，在这里遍历QUANTIZATION_METHODS，当 _ = 'gptq_marlin' 时，会取到 GPTQMarlinConfig (直接用vllm的)，
-            # 里面的 override_quantization_method 会根据配置信息确认能否使用gptq_marlin, 如何符合条件，就转成gptq_marlin.
-            # 继而会得到quantization_override='gptq_marlin'，从而将 self.quantization 设置为 gptq_marlin，走的不再是普通的gptq方案.
-            # 如果用户指定 quantization='gptq', 则 override_quantization_method 函数里会判断认为不做override, 仍采用用户指定的gptq方案
             for _, method in QUANTIZATION_METHODS.items():
                 quantization_override = method.override_quantization_method(
                     quant_cfg, self.quantization
@@ -314,7 +304,6 @@ class ModelConfig:
             eos_ids = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids)
         return eos_ids
 
-# <NT> 针对特定多模态模型对config进行调整，对于普通文本llm不做任何修改。
 def get_hf_text_config(config: PretrainedConfig):
     """Get the "sub" config relevant to llm for multi modal models.
     No op for pure text models.

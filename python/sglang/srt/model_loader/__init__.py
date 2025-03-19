@@ -18,7 +18,6 @@ def get_model(
     load_config: LoadConfig,
     device_config: DeviceConfig,
 ) -> nn.Module:
-    # <NT> 根据load_config获得特定加载器，如GGUFModelLoader和常用的DefaultModelLoader。
     loader = get_model_loader(load_config)
     return loader.load_model(
         model_config=model_config,

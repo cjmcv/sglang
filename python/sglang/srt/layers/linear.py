@@ -159,7 +159,6 @@ class UnquantizedLinearMethod(LinearMethodBase):
             ),
             requires_grad=False,
         )
-        # <NT> nn.Linear的权重是(out_features, in_features), 一行in_features个元素在内存上连续。
         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
@@ -170,9 +169,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
-        # <NT> 相当于 return torch.matmul(x, layer.weight.t()) + bias。
-        # 对于该linear文件中实现的线性层，非量化实现最底层都是调用这个pytorch的linear实现。
+        
         return F.linear(x, layer.weight, bias)
 
 
@@ -379,14 +376,9 @@ class ColumnParallelLinear(LinearBase):
             ),
         )
         if bias:
-            if (isinstance(self.quant_method, offload.UnquantizedCpuLinearMethod) == True): # offload
-                self.bias = Parameter(
-                    torch.empty(self.output_size_per_partition, dtype=params_dtype, device=torch.device('cpu'))
-                )
-            else:
-                self.bias = Parameter(
-                    torch.empty(self.output_size_per_partition, dtype=params_dtype)
-                )
+            self.bias = Parameter(
+                torch.empty(self.output_size_per_partition, dtype=params_dtype)
+            )
             set_weight_attrs(
                 self.bias,
                 {
@@ -537,7 +529,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: Optional[int] = None,
     ):
-        # <NT> GGUF专用的权重加载部分
         # Special case for GGUF
         # initialize GGUF param after we know the quantize type
         is_gguf_weight = getattr(param, "is_gguf_weight", False)
@@ -561,7 +552,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 self.qweight = param.materialize_nested()
             return
 
-        # <NT> 除了GGUF以外的权重加载部分
         param_data = param.data
         output_dim = getattr(param, "output_dim", None)
         # Special case for AQLM codebooks.
@@ -1191,11 +1181,6 @@ class RowParallelLinear(LinearBase):
             )
 
         if bias:
-            if (isinstance(self.quant_method, offload.UnquantizedCpuLinearMethod) == True):
-                self.bias = Parameter(torch.empty(self.output_size, dtype=params_dtype, device=torch.device('cpu')))
-            else:
-                self.bias = Parameter(torch.empty(self.output_size, dtype=params_dtype))
-        
             self.bias = Parameter(torch.empty(self.output_size, dtype=params_dtype))
             set_weight_attrs(
                 self.bias,
