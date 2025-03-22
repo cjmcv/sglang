@@ -32,7 +32,9 @@ class AttentionArch(IntEnum):
     MLA = auto()
     MHA = auto()
 
-
+# <NT> 在TpModelWorker的初始化中被构建
+# context_length: 可以通过server_args.context_length设置，表示模型能够处理的输入token数量。
+#                 如果不填，会从下面的hf_config中取出derived_context_len并覆盖，即读取模型文件配套的config文件，即每个模型固定。
 class ModelConfig:
     def __init__(
         self,

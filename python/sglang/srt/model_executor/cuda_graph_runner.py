@@ -67,6 +67,8 @@ def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
 # patch_model是根据是否需要做torch.compile, 而做了一层适配的中转，返回推理函数。
 # torch.compile会把model.forward的内容固化成静态graph，会采用采用算子融合、内存布局优化等策略，提高计算效率。
 # cuda graph是把cuda操作固化，如kernel launch和copy等，通过捕获（capture）一系列操作来减少启动开销。
+#           仅用于decode，因为cuda graph虽然会加速launch的速度，但需要固定内存布局，需要按每个batch_size去固化graph，有一定显存开销。
+#           在prefill阶段，launch损耗比例小，大头在计算，且bacth_size变化多样，难以兼顾，所以没必要为了省这点launch开销而浪费其他资源（如显存）。
 # 二者不冲突，可一起使用。cuda graph可以使用torch.compile前或compile后的计算过程。
 @contextmanager
 def patch_model(
@@ -329,7 +331,7 @@ class CudaGraphRunner:
                 save_gemlite_cache()
 
     # <NT> 基于一个batch_size去构建一个cuda graph。
-    # 因为 CUDA Graph 是基于固定的操作序列构建的，所以输入数据的形状和类型最好是相对固定的，所以会以batch_size划分。
+    # 因为 CUDA Graph 是基于固定的操作序列构建的，所以输入数据的形状和类型需要固定，所以会以batch_size划分。
     def capture_one_batch_size(self, bs: int, forward: Callable):
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
@@ -360,6 +362,7 @@ class CudaGraphRunner:
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             )
 
+        # <NT> 构建指定batch_size的推理数据 ForwardBatch
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
             batch_size=bs,
@@ -424,6 +427,8 @@ class CudaGraphRunner:
         global_graph_memory_pool = graph.pool() # 这里返回的是内存池的id号，可以在其他graph执行时被填入，共用内存池。
         return graph, out
 
+    # <NT> 初始化的时候完成capture，实际使用的时候调用replay执行capture好的流程
+    #      这个大的replay函数包含了拷贝数据进去和补pad操作，实际的replay是按补好pad的数据按选定的graph来做replay。
     def replay(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
         hidden_mode_from_spec_info = getattr(
@@ -443,6 +448,7 @@ class CudaGraphRunner:
             self.capture_hidden_mode = hidden_mode_from_spec_info
             self.capture()
 
+        # <NT> raw_bs实际用于推理时凑的batch_size, 但已被capture的batch_size不一定会刚好包含它，所以需要对它做pad操作，将其补到已被capture的bs上。
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.num_tokens_per_bs
 
@@ -453,6 +459,7 @@ class CudaGraphRunner:
             )
         else:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
+        # bs将会是被capture好的
         bs = self.capture_bs[index]
         if bs != raw_bs:
             self.seq_lens.fill_(1)
@@ -485,7 +492,9 @@ class CudaGraphRunner:
             forward_batch.spec_info,
         )
 
-		# <NT> 再次计算之前捕获的计算全流程，out = run_once()，其中的out已经被指向了self.output_buffers[bs]，所以从self.output_buffers[bs]里取数据即可。
+		# <NT> 按指定的bs拿到对应的graph做replay，replay的过程是 out = run_once()，
+        # 其中的out已经被指向了self.output_buffers[bs]，所以从self.output_buffers[bs]里取数据即可。
+        # input和output的内存是所有batch_size对应的graph都共享的。
         # Replay
         self.graphs[bs].replay()
         next_token_logits, hidden_states = self.output_buffers[bs]

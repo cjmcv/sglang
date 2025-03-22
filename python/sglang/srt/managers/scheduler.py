@@ -907,7 +907,7 @@ class Scheduler:
     # <NT> 
     # 1. 合并之前的extend/prefill batch里的还需要继续计算的部分（chunked prefill没算完的chunk，或prefill完还需要decode的）。
     # 2. 调用get_new_batch_prefill，从waiting queue中获取新请求（如有），得到新的prefill/extend batch，并将当前的running batch打包在一起返回出去。
-    # 3. 如果没有新的prefill batch，则更新解码的running batch并返回。
+    # 3. 如果没有新的prefill batch，则更新deocde的running batch并返回。
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         # <NT> 如果存在上一个计算的batch，且上一个batch是extend(或mixed)的，则说明该batch有没算完还需要继续计算的，这部分需要合并到当前的running_batch中。
         # prefill/extend后面都还需要接decode计算。
@@ -1222,6 +1222,11 @@ class Scheduler:
             self.current_stream.synchronize()
             batch.next_batch_sampling_info.sampling_info_done.set()
 
+    # <NT> prefill/extend的结果都归该函数处理
+    # 生成模型的结果是GenerationBatchResult，里面有
+    # 1.模型输出分数logits_output。
+    # 2.下次需要推理的next_token_ids。
+    # 3.ScheduleBatch的id号(全局变量，在get_model_worker_batch里赋值)。
     def process_batch_result_prefill(
         self,
         batch: ScheduleBatch,
@@ -1255,6 +1260,7 @@ class Scheduler:
 
             hidden_state_offset = 0
 
+            # <NT> 根据该batch的输出，判断里面有哪些req满足结束条件，需要从batch里退出来。
             # Check finish conditions
             logprob_pt = 0
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
@@ -1267,6 +1273,8 @@ class Scheduler:
                     self.token_to_kv_pool.free(batch.out_cache_loc[j : j + 1])
                     continue
 
+                # <NT> is_being_chunked <= 0, 表示该req的prefill/extend阶段已完成，正在进行的是decode阶段，
+                #      可以开始使用req.output_ids接收decode输出结果，并判断结束条件。
                 if req.is_being_chunked <= 0:
                     req.output_ids.append(next_token_id)
                     req.check_finished()
@@ -1336,6 +1344,7 @@ class Scheduler:
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
+    # <NT> 意味着该batch的所有req都不处于prefill/extend阶段。
     def process_batch_result_decode(
         self,
         batch: ScheduleBatch,

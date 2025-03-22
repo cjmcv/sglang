@@ -21,6 +21,10 @@ Memory pool.
 SGLang has two levels of memory pool.
 ReqToTokenPool maps a a request to its token locations.
 BaseTokenToKVPool maps a token location to its KV cache data.
+
+<NT> 两级内存池设计，第一级 ReqToTokenPool 将一个请求 req 映射到其对应的 token 位置。
+                   第二级 BaseTokenToKVPool 将一个 token 位置映射到其 kv cache 的数据。
+    ReqToTokenPool：
 """
 
 import logging
@@ -40,7 +44,24 @@ logger = logging.getLogger(__name__)
 
 GB = 1024 * 1024 * 1024
 
-
+# <NT> 将一个请求 req 映射到其对应的 token 位置.
+# 创建脉络：Scheduler.__init__: self.req_to_token_pool, self.token_to_kv_pool = self.tp_worker.get_memory_pool() , 从tp_worker中get出。Scheduler在构建ScheduleBatch时会传入。
+#          TpModelWorker.get_memory_pool: return (self.model_runner.req_to_token_pool, self.model_runner.token_to_kv_pool) , 
+#                                         即从model_runner中拿到。ModelRunner是在TpModelWorker.init里创建的。
+#          ModelRunner.init_memory_pool: 进行req_to_token_pool的实际创建操作。
+#                                       self.req_to_token_pool = ReqToTokenPool(
+#                                             size=max_num_reqs + 1,
+#                                             max_context_len=self.model_config.context_len + 4,
+#                                             device=self.device,
+#                                             enable_memory_saver=self.server_args.enable_memory_saver,
+#                                        )
+#          即实际创建和管理是在 ModelRunner 里进行的，但 Scheduler和ScheduleBatch 会对其进行相关操作。关键操作在ScheduleBatch里。
+#
+# 初始化函数：size：填充为max_num_reqs + 1，就是最大请求数量+1。
+#            max_context_len：是模型最大能处理的token数量，除非是用户手动设置，否则填的是模型文件配套的config文件的数据。
+#            enable_memory_saver：一个节省内存的python包。
+#            self.req_to_token: 实际的内存池，内存分配的是(size, max_context_len)的二维tensor，类型是int32。
+#            self.free_slots：按size大小创建一个free_slots列表，里面的值是从0到size-1，表示这些编号对应位置的请求req是空的，可以往里面插入新请求。
 class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
@@ -64,12 +85,19 @@ class ReqToTokenPool:
             )
         self.free_slots = list(range(size))
 
+    # <NT> 在ScheduleBatch在执行prepare_for_extend时调用。
+    # 遍历所有req，如对应req的pre_len不为0，即该req之前有计算过，有前缀。
+    # 则会把这些前缀的下标都写入到self.req_to_token：self.req_to_token_pool.write( (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices)
+    # indices将会是一个二维元组，行是从alloc获得的req空位的下标，列是从0到pre_len的位置上分别写入req.prefix_indices的所有token下标。
     def write(self, indices, values):
         self.req_to_token[indices] = values
 
     def available_size(self):
         return len(self.free_slots)
 
+    # <NT> alloc在ScheduleBatch.prepare_for_extend->alloc_req_slots里调用，会根据该batch有多少个req，从而调用alloc拿到相应数量的slot空位下标，
+    # 后面会往self.req_to_token的对应下标里写数据。其中need_size是req数量，如need_size为5，会将self.free_slots的前5个数据给出去并做更新。
+    # 如初始状态下，前5个数据是0-4，表示这5个数据对应的下标位置是空的，可以插入新的请求。
     def alloc(self, need_size: int) -> List[int]:
         if need_size > len(self.free_slots):
             return None

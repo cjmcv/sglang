@@ -173,7 +173,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
+        # <NT> 注意cuda graph里面无法执行python原生的print，因为graph replay里面都需要是cuda操作。
+        #      如使用 if torch.cuda.is_current_stream_capturing() 包含的部分，只能在capture阶段会打印，replay阶段将不会打印。
+        #      除非改用cuda版本的printf，如编一个kernel做打印。或将cpu打印推到cuda stream里。
         # <NT> 相当于 return torch.matmul(x, layer.weight.t()) + bias。
         # 对于该linear文件中实现的线性层，非量化实现最底层都是调用这个pytorch的linear实现。
         return F.linear(x, layer.weight, bias)
@@ -757,8 +759,37 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             use_presharded_weights=self.use_presharded_weights,
         )
 
-# <NT> 线性层(全连接层)，用于attention的QKV的线性变换。权重矩阵沿着输出维度拼接在一起，layer则沿着head维度并行。
-# 输出矩阵就是QKV的拼接矩阵。
+# <NT> 线性层(全连接层)，用于attention的QKV的线性变换，其权重矩阵沿着输出维度拼接在一起，输出矩阵就是QKV的拼接矩阵。
+# 该层在张量并行中会沿着head维度并行，但如果key/value的head比query的head要少时，如MQA和GQA，
+# 此时做张量并行需要切分head时，key/value的head会被复制多份，会有一定的重复计算。
+# 
+# 每个 head 都可以看作是一个相对独立的特征提取器，它们从不同的角度对输入数据进行处理，提取不同方面的特征。按 head 切分不会破坏模型的整体结构和功能。
+# MHA的k/v head与q head数量一致，MQA是所有个q对应一个k/v，GQA是几个q为一组，一组q对应一个k/v。（无论是哪种，k和v的head都是一致的）
+#
+# QKVParallelLinear基于列并行而设计，列并行针对普通gemm而言，mk * kn = mn，将kn切分成多个kn0，kn1, kn2等。
+# 且qkv对应部分也是按输出维度拼接在一起的，即n维度，
+# 以GQA为例，total_num_heads=4，total_num_kv_heads=2，则weight如下：
+#  n      w_q       w_k    w_v
+# k   00-00-00-00  11-11  22-22     
+#     00-00-00-00  11-11  22-22
+#     00-00-00-00  11-11  22-22
+#     00-00-00-00  11-11  22-22
+# 输入的hidden_state本应跟这三个矩阵分别线性层计算，分别得到q/k/v。
+# 权重矩阵weight的n维度是输出维度，得到的q/k/v矩阵的列数与权重矩阵的列数n是一致的，所以weight的n方向就是按head来排布的。
+# 所以得到的q/k/v将如下所示，里面如第一列的h0h0会对应w_q中第一列的00：
+#  n         q                k        v
+# m   h0h0-h1h1-h2h2-h3h3  h4h4-h5h5  h6h6-h7h7     
+#     h0h0-h1h1-h2h2-h3h3  h4h4-h5h5  h6h6-h7h7
+# 因为是基于列并行，即每个节点的输入数据是完整的，且会按head切分 (输出维度n)。
+# 如节点0负责w_q的h0和h1部分，w_k的h4，w_v的h6, 
+#   节点1负责w_q的h2和h2部分，w_k的h5，w_v的h7
+# head切分，各个节点独立计算，（不需要交互，TODO: kvcache也自己管自己的？）
+#
+# 问：为什么说当对应MQA和GQA这种q头数比k/v头数多的情况下，可能需要将k/v head复制多份。
+# 答：因为一个kv head对应多个q head，比如qh0-qh3对应kvh0，qh4-qh7对应kvh1，
+# 如果节点0划分到数据qh0-qh1，就要有kvh0；而节点1划分到qh2-qh3，也要有kvh0。就kv_head会多复制一份。
+# 注意：后面的分配策略都使用divide()函数进行，所有数据都必须能被整除。
+#      所以不会出现如kv_head数量是4，节点数是6的情况，这样分配会复杂不少，下面逻辑不再适用。
 class QKVParallelLinear(ColumnParallelLinear):
     """Linear layers for the attention's QKV transformation.
 
@@ -812,7 +843,14 @@ class QKVParallelLinear(ColumnParallelLinear):
         if tp_size is None:
             tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank, self.tp_size = tp_rank, tp_size
+        # <NT> 直接按q_head来分配，注意用的都是divide，里面会判断能否被整除，后面的代码都用了divide，即都要求是能被整除的。
         self.num_heads = divide(self.total_num_heads, tp_size)
+        # <NT> 假设有4个kv_head, 每个kv_head对应4个q_head, 共16个q_head.
+        #      如果有4个节点，则每个节点一人一个，q也刚好能整除, 每个节点有4个q_head。下面的num_kv_heads和num_kv_head_replicas都为1.
+        #      如果有6个节点, 无法被q_head整除，不支持。
+        #      如果有8个节点，上面的num_heads是total_num_heads//tp_size=16//8=2, 即一个节点有2个q_head, 01 23 45 67 89 1011 1213 1415, num_kv_heads为1，num_kv_head_replicas计算得2。
+        #                    节点(q_head, kv_head)-> 0(01,0) 1(23,0) 2(45,1) 3(67,1) 4(89,2) 5(1011,2) 6(1213,3) 7(1415,3)，即kv_head会有两份重复的，对应num_kv_head_replicas==2。
+        #      如果有2个节点，按num_kv_heads可以被分配到每个节点2个，num_kv_head_replicas自然是1，节点少，不需要复制。
         if tp_size >= self.total_num_kv_heads:
             self.num_kv_heads = 1
             self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
@@ -820,6 +858,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
             self.num_kv_head_replicas = 1
         input_size = self.hidden_size
+        # <NT> self.head_size是q_head和kv_head都共用的，即所有head的head_size都一致。对应权重输出维度N.
         output_size = (
             (self.num_heads + 2 * self.num_kv_heads) * tp_size * self.head_size
         )

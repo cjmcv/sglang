@@ -29,6 +29,10 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
   It contains low-level tensor data. Most of the data consists of GPU tensors.
 """
 
+# <NT> ScheduleBatch: 由Scheduler管理，包含高层级的调度数据，这些数据主要在cpu上。
+#      ModelWorkerBatch: 由TpModelWorker管理，是ScheduleBatch的子集，仅包含模型在gpu上推理相关的数据。
+#      ForwardBatch: 由ModelRunner管理，包含推理实际推理使用的张量数据。
+
 import dataclasses
 import logging
 from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
@@ -238,17 +242,23 @@ class Req:
         eos_token_ids: Optional[Set[int]] = None,
     ):
         # Input and output info
-        self.rid = rid
+        self.rid = rid   # <NT> Req id，单数据整型
         self.origin_input_text = origin_input_text
         self.origin_input_ids_unpadded = (
             origin_input_ids_unpadded
             if origin_input_ids_unpadded
             else origin_input_ids  # Before image padding
         )
+        # <NT> promts的token ids
         self.origin_input_ids = origin_input_ids
         # Each decode stage's output ids
+        # <NT> 每个decode阶段生成的输出token id，在prefill/extend阶段为空，每次处理batch计算结果时，
+        #      会将当前的next_token_id append进去，即会保留所有decode结果。
+        #      注：ScheduleBatch里的output_ids仅保存当前batch的输出结果，即也就是下一batch要计算的next_token_id。
         self.output_ids = []
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
+        # <NT> 被填充了的token_id, 包括原始prompts的输入token(self.origin_input_ids)和后面decode已生成的token(self.output_ids)，
+        #      最后一段会是当前batch计算的输出，也是下一个batch要计算的输入next_token_id
         self.fill_ids = None
         self.session_id = session_id
         self.input_embeds = input_embeds
@@ -292,6 +302,8 @@ class Req:
         self.last_node = None
 
         # Chunked prefill
+        # <NT> 表示该req被chunked的数量，当其小于等于0时，表示该req的prefill/extend阶段已完成。
+        #      prefile/extend阶段，每次batch推理会完成一次的chunk计算，is_being_chunked会减1.
         self.is_being_chunked = 0
 
         # For retraction
@@ -351,6 +363,47 @@ class Req:
         # Whether request reached finished condition
         return self.finished_reason is not None
 
+    # <NT> 只在Schedule.get_new_batch_prefill中调用, 会对self.prefix_indices赋值，表示前缀token的id号。
+    # self.rid是req的id号，在chunk cache中充当索引找到对应的seq的前缀。
+    # 而在radix cache中只需要用到key。
+    #
+    # origin_input_ids：一个req的prompts的token ids，对于每个req自创建后，一直不会被修改
+    #
+    # output_ids：有两个同名变量，Req.output_ids和ScheduleBatch.output_ids. 
+    # ScheduleBatch.output_ids 对应的是上一轮计算输出的next_token_ids，会在准备新一轮batch计算时充当输入。
+    #                          在Scheduler.run_batch中，一个batch计算完后输出next_token_ids, 
+    #                          会执行batch.output_ids = next_token_ids，传给ScheduleBatch，用于充当下一轮计算的输入。
+    # Req.output_ids在Scheduler.process_batch_result_prefill和Scheduler.process_batch_result_decode中被调用，每次batch推理后会处理batch_result,
+    #               将输出的next_token_id都append到output_ids里，所以req的output_ids会存放该req的到当前阶段之前所有decode输出，
+    #               以及当前阶段的decode输出，即下一轮推理要用到的next_token_id。
+    #               Req.output_ids仅针对decode阶段，prefill阶段一般都为0.
+    #
+    # 实际调试数据：
+    # fill_ids=  49, output_ids=0, prefix_indices=1, extend_input_len=48
+    # ModelRunner.forward extend
+    # ModelRunner.cuda_graph_runner.replay
+    # fill_ids=8926, output_ids=0, prefix_indices=48, extend_input_len=8878
+    # ModelRunner.forward extend
+    # fill_ids=8926, output_ids=0, prefix_indices=2096, extend_input_len=6830
+    # fill_ids=57, output_ids=0, prefix_indices=48, extend_input_len=9
+    # ModelRunner.forward extend
+    # fill_ids=8926, output_ids=0, prefix_indices=4144, extend_input_len=4782
+    # fill_ids=57, output_ids=0, prefix_indices=48, extend_input_len=9
+    # ModelRunner.forward extend
+    # fill_ids=8926, output_ids=0, prefix_indices=6192, extend_input_len=2734
+    # fill_ids=57, output_ids=0, prefix_indices=48, extend_input_len=9
+    # ModelRunner.forward extend
+    # fill_ids=8926, output_ids=0, prefix_indices=8240, extend_input_len=686
+    # fill_ids=57, output_ids=0, prefix_indices=48, extend_input_len=9
+    # ModelRunner.forward extend
+    # ModelRunner.cuda_graph_runner.replay 。。。
+    # 
+    # 观察上面数据可以看到，当出现超长文本时，每次进入这里origin_input_ids都是不会变的，就是prompts的总长度，
+    # 因为在这里的都是处理prompt部分，不包含解码部分而output_ids一直为零（这函数为什么要使用output_ids，原因不明确，可能跟全局使用fill_ids的风格有关）。
+    #
+    # self.prefix_indices是匹配到的前缀token ids，除了这里调用了tree_cache.match_prefix之外。
+    # 主要的更新地方是：Scheduler.get_new_batch_prefill -> SchedulePolicy.calc_priority -> _compute_prefix_matches -> self.tree_cache.match_prefix.
+    #
     def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
         self.fill_ids = self.origin_input_ids + self.output_ids
         if tree_cache is not None:
@@ -741,19 +794,23 @@ class ScheduleBatch:
 
         assert len(self.out_cache_loc) == self.extend_num_tokens
 
-    # <NT> 
+    # <NT-TODO> ScheduleBatch.prepare_for_extend，在Scheduler.get_new_batch_prefill中被调用, 该函数是准备一个全新的prefill batch，里面的req全都是新进入的。
+    # 功能包括：1. 为每个req填充req_to_token_pool，建立req与其token_id的映射位置。
+    #          2. 根据涵盖的所有req的信息，填充self的变量信息，
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
 
         bs = len(self.reqs) # 会有多个请求序列
         reqs = self.reqs
-        # len(r.prefix_indices)即该请求r的前缀数量，总数去掉前缀部分，剩下的就是extend的(输入)大小
+        # len(r.prefix_indices)即该请求r的前缀数量，总数fill_ids去掉前缀部分，剩下的就是extend的(输入)大小，
+        # 因为fill_ids里包含有output_ids, 里面有包含上一batch计算得到的next_token_ids, 用于充当当前batch的输入。
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids) # 将所有req的extend大小都累加起来，就是本次处理的extend总token数，可用于内存分配。
         seq_lens = []
         pre_lens = []
 
-        # Allocate memory，入口信息，用于索引。
+        # Allocate memory
+        # prepare_for_extend里的req全都是新的吗？为什么都要申请新的槽位？
         req_pool_indices = self.alloc_req_slots(bs)
         out_cache_loc = self.alloc_token_slots(extend_num_tokens)
 
@@ -762,10 +819,15 @@ class ScheduleBatch:
         pt = 0
         for i, req in enumerate(reqs):
             req.req_pool_idx = req_pool_indices[i]
-            pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids) # pre_len是前缀长度；eq_len是seq总长度，包含前缀长度和本次extend的长度
+            # <NT-TODO> prefix_indices是前缀token id；
+            # fill_ids是包含prompts和decode到当前阶段的所有decode输出token_id集合，如果是prefill/extend阶段，那seq_len就是prompts的token_id.
+            # seq_len - pre_len 就是 prompts部分减去被缓存了的部分，剩下的就是还需要做extend的部分。
+            # TODO: 如果超长，会分段处理，分段处理的位置在哪里？
+            pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids) 
             seq_lens.append(seq_len)                                      # seq_lens的每个元素表示该请求所对应的序列的长度。
             assert seq_len - pre_len == req.extend_input_len              # 二次核验: 序列长度 - 前缀长度 = extend长度
 
+            # <NT> 如果该req的prefix_indices有内容，则将其按申请到的空位req_pool_idx（行）写入到req_to_token_pool的0-pre_len列中。
             if pre_len > 0:
                 self.req_to_token_pool.write(
                     (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices
@@ -788,6 +850,7 @@ class ScheduleBatch:
                     )
                 req.extend_logprob_start_len = extend_logprob_start_len
 
+            # <NT> 预先更新，实际上还没有开始算？？？？？？？
             req.cached_tokens += pre_len - req.already_computed
             req.already_computed = seq_len
             req.is_retracted = False
@@ -1054,6 +1117,7 @@ class ScheduleBatch:
             enable_overlap_schedule=self.enable_overlap,
         )
 
+    # <NT> output_ids在Scheduler.run_batch中，会有batch.output_ids = next_token_ids，拿到上一轮数据的输出token ids，用于充当下一轮计算的输入。
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         if self.spec_algorithm.is_eagle():

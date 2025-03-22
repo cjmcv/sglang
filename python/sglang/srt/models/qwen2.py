@@ -151,6 +151,7 @@ class Qwen2Attention(nn.Module):
             layer_id=layer_id,
         )
 
+    # <NT> rotary_emb仅应用于q/k, v不参与。
     def forward(
         self,
         positions: torch.Tensor,
@@ -221,8 +222,23 @@ class Qwen2DecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
-
-
+    
+# <NT> Qwen2Model定义
+# -> VocabParallelEmbedding 
+# -> for 多个相同的 Qwen2DecoderLayer (数量是num_hidden_layers)
+#    -> RMSNorm (input_layernorm)
+#    -> Qwen2Attention - self attention
+#       -> qkv, _ = QKVParallelLinear   输入hidden_states与三个线性层计算，分别得到q/k/v，而QKVParallelLinear就是这三个普通线性层合并而成。
+#       -> qkv.split
+#       -> q,k = RotaryEmbedding(positions, q, k)
+#       -> RadixAttention(q,k,v)
+#       -> RowParallelLinear
+#    -> RMSNorm (post_attention_layernorm)
+#    -> Qwen2MLP
+#       ->  gate_up_proj - MergedColumnParallelLinear
+#       ->  act_fn       - SiluAndMul
+#       ->  down_proj    - RowParallelLinear - all reduce
+# -> RMSNorm
 class Qwen2Model(nn.Module):
     def __init__(
         self,

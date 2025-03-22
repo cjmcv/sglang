@@ -705,6 +705,8 @@ class ModelRunner:
         c = a @ b
         return c
 
+    # <NT> Attention后端接入口，在ModeRunner的初始化函数中调用.
+    # <NT> TODO:  flashinfer 和 flashinfer_mla分开的原因。
     def init_attention_backend(self):
         """Init attention kernel backend."""
         if self.server_args.attention_backend == "flashinfer":
