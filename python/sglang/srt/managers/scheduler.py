@@ -307,13 +307,20 @@ class Scheduler:
         # Init memory pool and cache
         self.req_to_token_pool, self.token_to_kv_pool = self.tp_worker.get_memory_pool()
 
-        # <NT> 如未明确指定chunked_prefill_size且未明确关闭RadixCache，则默认使用RadixCache
-        # ChunkCache和RadixCache均是BasePrefixCache的派生类，二者都用了prefix cache的方式进行
-        # ChunkCache对应普通的chunk prefill加上生硬的匹配(在字典中逐个查找)达到prefixCache的效果
-        # RadixCache则对应RadixAttention，使用基数树去去构建和匹配前缀，以达到prefixCache的效果
-        # 
-        # Chunked prefill是将长度不一的prefill拆分成多个大小相同的块，其次这些 chunks 间的气泡可以插入/捎带（piggyback）其他完成了prefill的prompts的decode需求，与decode组成batch一起计算。
-        # RadixAttention也是按小分块来进行的，也会把prefill分成小块，额外使用了基数树来管理前缀。
+        # <NT> 如未明确指定chunked_prefill_size且未明确关闭RadixCache，则默认使用RadixCache。
+        # ChunkCache和RadixCache均是BasePrefixCache的派生类，管理req_to_token_pool和token_to_kv_pool.
+        # 但是ChunkCache没有实现prefix cache的功能，即不同seq之间无法共享前缀kvcache。
+        #
+        # ChunkCache：以req为主体，每个req维护一个列表，列表存放的是从req_to_token_pool检索得到其包含的token的kv_indices，
+        #             进而可以从token_to_kv_pool拿到对应的kvcache。
+        #             维护seq对应列表entry，基本等同于直接用req_to_token_pool，多包一层可能只是方便与radix接口对齐。
+        #             当seq结束时，会释放对应seq的entry/req_to_token_pool和token_to_kv_pool里所属token的内存。
+        #             所以如果后面出现的seq拥有与之前出现过的seq大体相同的前缀，因为之前的seq已经结束了，其对应的token的kvcache也释放了，
+        #             后来的seq将无法共享之前seq的token的kvcache了。
+        #          问：为什么要释放token_to_kv_pool里所属token的内存？回答见ChunkCache.cache_finished_req笔记。
+        #
+        # RadixCache：以token id为主体，构建基数树。采用LRU管理token_to_kv_pool里面以token节点为单位的kvcache，只有超时才会释放。
+        #             所以新seq到来，如拥有相同前缀，可以直接取到之前seq计算时留下的token的kvcache。实现prefix cache的功能。
         if (
             server_args.chunked_prefill_size is not None
             and server_args.disable_radix_cache
@@ -904,7 +911,7 @@ class Scheduler:
             if crash_on_warnings():
                 raise ValueError(msg)
 
-    # <NT> 
+    # <NT> get_next_batch_to_run
     # 1. 合并之前的extend/prefill batch里的还需要继续计算的部分（chunked prefill没算完的chunk，或prefill完还需要decode的）。
     # 2. 调用get_new_batch_prefill，从waiting queue中获取新请求（如有），得到新的prefill/extend batch，并将当前的running batch打包在一起返回出去。
     # 3. 如果没有新的prefill batch，则更新deocde的running batch并返回。

@@ -605,8 +605,7 @@ class FusedMoE(torch.nn.Module):
             activation=self.activation,
         )
 
-        # <NT> 
-        # TP下，上面的每层的权重矩阵切分后，矩阵乘计算的就是矩阵的分块，需要将各节点的分块都reduce到一起。
+        # <NT> TP下，上面的每层的权重矩阵切分后，矩阵乘计算的就是矩阵的分块，需要将各节点的分块都reduce到一起。
         # 结果是叠加，所以是all reduce，而不是all gather。
         # MQ: 里面有一个RowParallelLinear，所以需要all reduce？列划分需要all gather。这里默认self.reduce_results为False，是因为外面也有一个all reduce，所以里面不做了。
         #     这样看FusedMoE和EPMoE都需要做一次all reduce，通信量一致？

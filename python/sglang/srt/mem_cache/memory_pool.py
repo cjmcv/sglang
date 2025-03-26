@@ -22,7 +22,7 @@ SGLang has two levels of memory pool.
 ReqToTokenPool maps a a request to its token locations.
 BaseTokenToKVPool maps a token location to its KV cache data.
 
-<NT> 两级内存池设计，第一级 ReqToTokenPool 将一个请求 req 映射到其对应的 token 位置。
+<NT> 两级内存池设计，第一级 ReqToTokenPool 将一个请求 req 映射到其对应的 token 位置, 即存放的元素是BaseTokenToKVPool的token索引。
                    第二级 BaseTokenToKVPool 将一个 token 位置映射到其 kv cache 的数据。
     ReqToTokenPool：
 """
@@ -116,7 +116,13 @@ class ReqToTokenPool:
     def clear(self):
         self.free_slots = list(range(self.size))
 
-
+# <NT> 将一个token映射到其kvcache数据存放的位置
+# 创建过程与ReqToTokenPool一致，但是TokenToKVPool会按架构区分：
+# MLATokenToKVPool / DoubleSparseTokenToKVPool / MHATokenToKVPool (除了MLA和DoubleSparse, 剩下的都是MHA(GQA的kvcache与MHA的一致))
+# size是max_total_num_tokens由剩余显存计算得出，dtype只区分auto和fp8
+# 
+# 与ReqToTokenPool的关系，ReqToTokenPool可由req拿到所属token在kvcache上的存放位置，即kvcache ids.
+# 通过这个与token一一对应的kvcache id去BaseTokenToKVPool里定位到该token具体的kvcache存放位置。
 class BaseTokenToKVPool:
     """A memory pool that maps a token location to its kv cache data."""
 
@@ -138,11 +144,17 @@ class BaseTokenToKVPool:
         self.free_slots = None
         self.is_not_in_free_group = True
         self.free_group = []
+        # <NT> 将free_slots初始化为从1-size+1的数据，用来表示token的空闲槽位的下标。
         self.clear()
 
     def available_size(self):
         return len(self.free_slots)
 
+    # <NT> 在ScheduleBatch.prepare_for_extend中调用 out_cache_loc = self.alloc_token_slots(extend_num_tokens)，
+    #      need_size=extend_num_tokens，对应的是新构建的batch中当前当前需要做extend计算的token数,
+    #      按token数申请空槽位，返回的是充当下标的tensor，在set_kv_buffer函数中作为loc参数输入，
+    #      里面每个元素表示的是token存放的下标，对应该轮ScheduleBatch计算的输出结果。
+    #      普通mha的kvcache维度是[layer_id][token][head_num*head_dim]，这里返回的是空闲的kvcache id集合，与token一一对应。
     def alloc(self, need_size: int):
         if need_size > len(self.free_slots):
             return None
@@ -194,7 +206,17 @@ class BaseTokenToKVPool:
     ) -> None:
         raise NotImplementedError()
 
-
+# <NT> MHATokenToKVPool 
+# 创建例子，在ModelRunner中：
+# self.token_to_kv_pool = MHATokenToKVPool(
+#     self.max_total_num_tokens,    # 等于 self.profile_max_num_token(total_gpu_memory)，从(load model后)剩余gpu内存中按架构进行估算，主要分mla和非mla。
+#     dtype=self.kv_cache_dtype,    # 分auto / fp8_e5m2 和 fp8_e4m3
+#     head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),  # 总的kv_head数量 除以 张量并行节点数
+#     head_dim=self.model_config.head_dim,                                   # head_dim, kv_head和q_head的head dim都是一样的
+#     layer_num=self.model_config.num_hidden_layers,   # mha层数量，每个层的kvcache是独立的。进一步以qwen2为例，搜class Qwen2Model(nn.Module)阅读
+#     device=self.device,
+#     enable_memory_saver=self.server_args.enable_memory_saver,
+# )
 class MHATokenToKVPool(BaseTokenToKVPool):
 
     def __init__(
@@ -223,6 +245,8 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             f"KV Cache is allocated. K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB."
         )
 
+    # <NT-TODO> 每个层一份，每份按最大token数分配，每个token是head_num*head_dim的矩阵，k和v独立。
+    # 即cache在底层是一大块连续空间，使用radix cache是对这一大块空间构建额外的索引组成树状。
     def _create_buffers(self):
         with self.memory_saver_adapter.region():
             # [size, head_num, head_dim] for each layer
@@ -292,6 +316,8 @@ class MHATokenToKVPool(BaseTokenToKVPool):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
+    # <NT> loc是从BaseTokenToKVPool.alloc中申请得到的与token一一对应的kvcache id集合，对应一个batch计算的输出token。
+    # 布局：[layer_id][token][head_num*head_dim]
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -346,6 +372,10 @@ class MLATokenToKVPool(BaseTokenToKVPool):
 
         with memory_saver_adapter.region():
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
+            # <NT> k和v共存，布局同样也是[layer_id][token][head_num*head_dim]，
+            # 只是head_num=1, head_dim=kv_lora_rank + qk_rope_head_dim
+            # 与mha的kv分开管理不同，这里kv在同一个kv_buffer上。
+            # 其中
             self.kv_buffer = [
                 torch.empty(
                     (size + 1, 1, kv_lora_rank + qk_rope_head_dim),
@@ -355,11 +385,14 @@ class MLATokenToKVPool(BaseTokenToKVPool):
                 for _ in range(layer_num)
             ]
 
+    # <NT> shape是(size + 1, 1, kv_lora_rank + qk_rope_head_dim)
     def get_key_buffer(self, layer_id: int):
         if self.store_dtype != self.dtype:
             return self.kv_buffer[layer_id].view(self.dtype)
         return self.kv_buffer[layer_id]
-
+    
+    # <NT-TODO> [..., : self.kv_lora_rank]是取最后一个维度的前kv_lora_rank的数据，
+    # 即shape是(size + 1, 1, self.kv_lora_rank)， 为什么是这个维度？
     def get_value_buffer(self, layer_id: int):
         if self.store_dtype != self.dtype:
             return self.kv_buffer[layer_id][..., : self.kv_lora_rank].view(self.dtype)
@@ -368,6 +401,7 @@ class MLATokenToKVPool(BaseTokenToKVPool):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
+    # <NT> 在deepseek v2中cache_k对应的是latent_cache
     def set_kv_buffer(
         self,
         layer: RadixAttention,

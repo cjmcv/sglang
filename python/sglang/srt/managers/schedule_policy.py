@@ -144,6 +144,9 @@ class SchedulePolicy:
         self.waiting_queue_radix_tree.reset()
 
         for r in waiting_queue:
+            # <NT> 获取最长前缀的token id集，并根据token id集通过match_prefix找到这些token在kvcache中的存放位置。
+            # radix cache中不需要输入rid，里面组件基数树，只有节点和token的概念，不与req绑定。
+            # chunk cache中需要输入rid，里面会根据req来存放kvcache的存放位置。
             prefix_ids = r.adjust_max_prefix_ids()
 
             # NOTE: the prefix_indices must always be aligned with last_node
