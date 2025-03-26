@@ -59,6 +59,8 @@ class RadixAttention(nn.Module):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
+        # <NT> 通常每个attention层都拥有自己的kvcache，不同的attention层关注输入序列的不同特征和信息，它们的K和V矩阵是独立计算的。
+        # 也存在跨层共享kvcache的情况，但不多。
         if k is not None:
             # For cross-layer sharing, kv can be None
             assert v is not None

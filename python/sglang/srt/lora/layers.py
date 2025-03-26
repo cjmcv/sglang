@@ -190,6 +190,11 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
     ) -> None:
         super().__init__(base_layer, lora_rank, scaling, lora_backend)
 
+	# <NT> 该函数会在ForwardBatch.init_new->prepare_lora_batch中被调用，即每次推理前都会调用一次，以更新当前batch数据对应的lora信息
+    # 信息重点是bs，seg_indptr（请求划分） 和 weight_indices。
+    # set_lora是这个ForwardBatch是否需要计算lora的标志位，即如果调用到set_lora_info，则需要计算lora，否则不计算。看父类ColumnParallelLinearWithLoRA的forward函数。
+    # 因为在初始化时，init_loras已经完成了对该模型的层的替换，把相对应的层都换成了带lora的新层。新层会先计算原始层的内容，然后计算lora。
+    # 但因为不是每个请求都需要计算，而且lora模块会根据请求类型更换，所以有set_lora表示是否需要计算lora，其他参数表示要计算的lora内容。TODO:目前set_lora_info是
     def set_lora_info(
         self,
         A_buffer_qkv: torch.Tensor,
@@ -229,6 +234,19 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
                 B_buffer_kv,
             )
 
+    # <NT> apply_lora会在每次调用该层的forward时调用。
+    # lora的计算公式：无lora Y=X*W, 有lora Y=X*(W+AB)
+    # 可以分成两种方式计算：
+    # 1. 事先将lora的AB矩阵合入到原来矩阵权重中，得到新的W1=W0+A*B，Y=X*W1
+    # 2. 不保留修改后的权重，原来权重的计算照旧，即Y=X*W0 + X*A*B
+    # 这里采用的是第二种方式，原因在于可以随着batch的数据，动态切换各种各样的lora模块，lora模块会跟batch里的每个seq一一对应。
+    # (TokenizerManager) -> generate_request -> _tokenize_one_request -> (Scheduler) -> recv_from_tokenizer -> TokenizedGenerateReqInput
+    #  -> recv_req.lora_path -> ModelWorkerBatch(python/sglang/srt/managers/schedule_batch.py#1106) -> ForwardBatch.lora_paths
+    # 从最初的generate_request就已经有指定lora_path了。每个req对应一个lora_path，但是基础模型都共用一个，所以不采用动态执行而不保存修改后的权重。
+    #
+    # apply_lora函数里，base_output是基础模型的计算输出，即上面的X*W0, 是已经算好了的。
+    # apply_lora函数需要计算X*A*B，然后与X*W0相加得到lora的叠加输出。
+    # 注：当前版本已经融合成了run_qkv_lora，进一步阅读。
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         backend_kwargs = {"base_output": base_output, "scaling": self.scaling}
         if self.lora_backend.fuse_stacked_lora_b:
@@ -346,6 +364,11 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
 def get_lora_layer(
     layer: nn.Module, lora_rank: int, scaling: int, lora_backend: BaseLoRABackend
 ) -> BaseLayerWithLoRA:
+	# <NT> 下面是lora支持的层，左边是并入lora前的(即原始模型定义的)，右边是并入lora后的。
+    # 函数输入的layer就是原始模型定义层，通过这个层，看能否找到对应的lora层，
+    # 找到则构造一个对应lora层对象，并返回。如果找不到则不支持。
+    # note: 都带有Parallel字样，因为这些层都考虑了张量并行，会按rank进行权重的加载和计算。
+    #       lora的AB矩阵也要随之加载和分块计算。因为lora权重少，直接全量加载，计算时分块即可？
     supported_layer_types = {
         # the order matters
         VocabParallelEmbedding: VocabParallelEmbeddingWithLoRA,

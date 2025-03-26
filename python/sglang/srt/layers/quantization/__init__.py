@@ -183,7 +183,7 @@ def get_linear_quant_method(
         return linear_method_cls(cloned_config)
     return None
 
-
+# <NT> gptq的线性层Linear 和 FusedMoE 都将使用vllm里面实现的marlin方案
 def gptq_get_quant_method(self, layer, prefix):
     if not VLLM_AVAILABLE:
         return None
@@ -314,7 +314,11 @@ def monkey_patch_moe_apply(class_obj: "FusedMoEMethodBase"):
     except (ImportError, AttributeError):
         return
 
-
+# <NT> 量化实现方案中对gptq和awq的猴子补丁。
+# 如 GPTQMarlinConfig 中本身有 get_quant_method 函数，而GPTQMarlinConfig是vllm里面的实现，
+# 这里想要用自己的实现去 gptq_get_quant_method 去更换里面原有的get_quant_method。
+# 后续通过 GPTQMarlinConfig.get_quant_method 就可以调用到 gptq_get_quant_method。
+# gguf格式的猴子补丁是在ModelRunner.load_model时调用的monkey_patch_vllm_gguf_config，可能是因为用的少，不在初始化时强制执行？
 def monkey_patch_quant_configs():
     """Apply all monkey patches in one place."""
     if not VLLM_AVAILABLE:

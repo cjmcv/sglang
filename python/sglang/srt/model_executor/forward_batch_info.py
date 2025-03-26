@@ -54,6 +54,11 @@ if TYPE_CHECKING:
 class ForwardMode(IntEnum):
     # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
     # It is also called "prefill" in common terminology.
+    # <NT> 用于在给定已生成的文本序列基础上，预测下一个或多个token。
+    # 目前理解：prefill也是按chunk prefill进行，即将prefill分块，再组成batch进行计算。q的行数即是序列的长度，长度len行拆分成多个m行的q矩阵。
+    #          多个chunk接连进行计算，这个过程相当于调用多次extend，每次extend序列的一块内容，因此prefill可以用extend来代替。
+    #          extend的batch内，同属于一个序列，即共用一份kvcache。
+    #          decode的batch内，每行都来自不同的序列，有各自的kvcache。
     EXTEND = auto()
     # Decode one token.
     DECODE = auto()
@@ -130,6 +135,7 @@ class CaptureHiddenMode(IntEnum):
 
 @dataclass
 class ForwardBatch:
+    # <NT> 对应多个序列组成的batch进行推理计算。里面包含有其各自生成的kvcache，会随着生成过程一直更新。
     """Store all inputs of a forward pass."""
 
     # The forward mode
@@ -142,6 +148,7 @@ class ForwardBatch:
     req_pool_indices: torch.Tensor
     # The sequence length
     seq_lens: torch.Tensor
+    # <NT> 标记新拼接到token_to_kv_pool的kv数据的下标，会按生成顺序从前往后堆叠。
     # The indices of output tokens in the token_to_kv_pool
     out_cache_loc: torch.Tensor
 
@@ -194,7 +201,10 @@ class ForwardBatch:
     sampling_info: SamplingBatchInfo = None
 
     # Attention backend
+    ## <NT> 内存池，用于将req请求映射到其token位置
     req_to_token_pool: ReqToTokenPool = None
+    ## <NT> 内存池，用于将token位置映射到其kv-cache数据。
+    ## 里面对于每个attention layer(模型里会有多个结构一样的重复堆叠的attention层)都会有一份k_buffer和v_buffer，使用时通过layer id索引。
     token_to_kv_pool: KVCache = None
     attn_backend: AttentionBackend = None
 
@@ -223,6 +233,8 @@ class ForwardBatch:
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
 
+
+    # <NT> 用@classmethod修饰，cls指向类本身，即可通过类名直接访问该函数进行类对象的构建。
     @classmethod
     def init_new(
         cls,
@@ -235,6 +247,7 @@ class ForwardBatch:
             extend_input_logprob_token_ids_gpu = (
                 batch.extend_input_logprob_token_ids.to(device, non_blocking=True)
             )
+        # <NT> cls() 即为 ForwardBatch的构造与成员变量的赋值
         ret = cls(
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
@@ -293,6 +306,9 @@ class ForwardBatch:
         ):
             ret.positions = ret.spec_info.positions
 
+        # <NT> 如果batch里全是decode数据，则不需要位置信息，因为位置就是下一位。
+        # 如果不都是decode，则需要按extend来看，extend是在某段完成后，退出的batch，然后再重新从waiting_queue中以新seq来加入batch的数据，需要提供extend的片段处于原始seq中的位置。
+        # 如果是全新seq的prefill，也会用到前缀数据，拼接前缀后也需要填充位置信息。且按chunked prefill来计算，prefill分段后也就变成了一个小段prefill+多个小段extend了。
         # Init position information
         if ret.forward_mode.is_decode():
             if ret.positions is None:
