@@ -964,7 +964,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Allocate req slots
         bs = len(self.reqs)
-        <NT> req_pool_indices：因为这个函数是准备一个全新的prefill batch，所以里面的req都要在req_to_token_pool中申请新的槽位, 用于从req映射到token
+        # <NT> req_pool_indices：因为这个函数是准备一个全新的prefill batch，所以里面的req都要在req_to_token_pool中申请新的槽位, 用于从req映射到token
         req_pool_indices = self.alloc_req_slots(bs)
 
         # Init tensors
@@ -1198,7 +1198,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # TODO(sang): Clean up finish path and support better retract
         # policy.
         if not server_args.speculative_algorithm:
-        	# output_ids和origin_input_ids进行排序，output_ids长度从大到小降序排列，如相同时，按origin_input_ids从小到大排。
+        	# <NT> output_ids和origin_input_ids进行排序，output_ids长度从大到小降序排列，如相同时，按origin_input_ids从小到大排。
             sorted_indices.sort(
                 key=lambda i: (
                     len(self.reqs[i].output_ids),

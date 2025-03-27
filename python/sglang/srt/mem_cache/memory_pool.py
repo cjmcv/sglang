@@ -22,10 +22,16 @@ SGLang has two levels of memory pool.
 ReqToTokenPool maps a request to its token locations.
 TokenToKVPoolAllocator manages the indices to kv cache data.
 KVCache actually holds the physical kv cache.
-<NT> 两级内存池设计，第一级 ReqToTokenPool 将一个请求 req 映射到其对应的 token 位置, 即存放的元素是BaseTokenToKVPool的token索引。
-                   第二级 BaseTokenToKVPool 将一个 token 位置映射到其 kv cache 的数据。
 """
 
+# <NT> ReqToTokenPool / TokenToKVPoolAllocator / KVCache (MHA/MLA/DoubleSparse)
+# kvcache的管理主要由这三个类组成，
+# ReqToTokenPool管理seq的槽位，负责从seq到token位置的映射，里面存放的元素是seq所属的token在 TokenToKVPoolAllocator 的槽位的索引。
+#               因为token id数值范围很广，不能直接用于内存索引，所以需要动态地将token id转为实际索引，kv_indices。
+# TokenToKVPoolAllocator管理token的槽位，负责从token到实际kvcache内存的映射，里面存放的元素是该token对应的 KVCache 的内存索引。
+# KVCache管理实际的kvcache内存，通过TokenToKVPoolAllocator拿到的token对应的内存索引，可以取出其对应的kvcache数据。
+# 
+# 除了这三类，还有一类叫HostKVCache(MHA/MLA/DoubleSparse)，管理host端的kvcache内存，除此之外与普通的KVCache不同点还有它兼顾了TokenToKVPoolAllocator的功能，也管理了token的槽位！！关系有点乱。。
 import abc
 import logging
 import threading
@@ -160,10 +166,12 @@ class KVCache(abc.ABC):
 # <NT> 将一个token映射到其kvcache数据存放的位置
 # 创建过程与ReqToTokenPool一致，但是TokenToKVPool会按架构区分：
 # MLATokenToKVPool / DoubleSparseTokenToKVPool / MHATokenToKVPool (除了MLA和DoubleSparse, 剩下的都是MHA(GQA的kvcache与MHA的一致))
-# size是max_total_num_tokens由剩余显存计算得出，dtype只区分auto和fp8
+# 命名为kvcache，size是max_total_num_tokens由剩余显存计算得出，dtype只区分auto和fp8
 # 
 # 与ReqToTokenPool的关系，ReqToTokenPool可由req拿到所属token在kvcache上的存放位置，即kvcache ids.
 # 通过这个与token一一对应的kvcache id去BaseTokenToKVPool里定位到该token具体的kvcache存放位置。
+#
+# 这里的TokenToKVPoolAllocator是对kvcache做了进一步的封装，负责token槽位的管理，实际内存由KVCache管理。
 class TokenToKVPoolAllocator:
     """An allocator managing the indices to kv cache data."""
 
@@ -381,7 +389,7 @@ class MHATokenToKVPool(KVCache):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
-    # <NT> loc是从BaseTokenToKVPool.alloc中申请得到的与token一一对应的kvcache id集合，对应一个batch计算的输出token。
+    # <NT> loc是从 TokenToKVPoolAllocator.alloc 中申请得到的与token一一对应的kvcache id集合，对应一个batch计算的输出token。
     # 布局：[layer_id][token][head_num*head_dim]
     def set_kv_buffer(
         self,
@@ -632,7 +640,8 @@ class DoubleSparseTokenToKVPool(KVCache):
     def transfer_per_layer(self, indices, flat_data, layer_id):
         pass
 
-
+# <NT-TODO> PROTECTED: 
+#      SYNCED: 从host到device已经同步好
 class MemoryStateInt(IntEnum):
     IDLE = 0
     RESERVED = 1
@@ -824,7 +833,8 @@ class HostKVCache(abc.ABC):
             )
         self.mem_state[indices] = MemoryStateInt.SYNCED
 
-
+# <NT> Host版本，需要输入device_pool，根据host_to_device_ratio来申请host端内存。
+# 内存大小为device_pool.size * host_to_device_ratio。
 class MHATokenToKVPoolHost(HostKVCache):
     def __init__(
         self,

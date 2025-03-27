@@ -20,7 +20,9 @@ from sglang.srt.mem_cache.radix_cache import _key_match_page_size1 as _key_match
 
 logger = logging.getLogger(__name__)
 
-
+# <NT> HiRadixCache 分层级的RadixCache
+# 1. 取出的self.kv_cache默认会是显存的，根据其类型分配与之对应的host端的kvcache，内存大小为device_pool.size * host_to_device_ratio。
+# 2. 新增一个HiCacheController，同时输入gpu端和host端的token_to_kv_pool（kvcache），用于二者的数据交互。
 class HiRadixCache(RadixCache):
 
     def __init__(
@@ -74,6 +76,7 @@ class HiRadixCache(RadixCache):
         self.token_to_kv_pool_host.clear()
         super().reset()
 
+    # <NT> 获取该子节点的高度，从子节点出发往根节点方向走，每走一步高度加1.
     def get_height(self, node: TreeNode):
         height = 0
         while node != self.root_node:

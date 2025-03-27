@@ -39,13 +39,17 @@ class TreeNode:
 
     counter = 0
 
+    # <NT> TreeNode.key  : token id
+    #      TreeNode.value: token在kvcache的存放位置，kv_indices
+    #      TreeNode.lock_ref        : 引用计数，表示有多少个正在计算的seq用着它。
+    #      TreeNode.last_access_time: 时间标记，用于LRU淘汰策略
     def __init__(self, id: Optional[int] = None):
         self.children = defaultdict(TreeNode)
         self.parent = None
-        self.key = None                     # token id
-        self.value = None                   # token在kvcache的存放位置，kv_indices。
-        self.lock_ref = 0                   # 引用计数，表示有多少个正在计算的seq用着它。
-        self.last_access_time = time.time() # 时间标记，用于LRU淘汰策略
+        self.key = None
+        self.value = None
+        self.lock_ref = 0
+        self.last_access_time = time.time()
 
         self.hit_count = 0
         # indicating the node is loading KV cache from host
@@ -69,7 +73,8 @@ class TreeNode:
     def __lt__(self, other: "TreeNode"):
         return self.last_access_time < other.last_access_time
 
-# <NT> 找出 key0 和 key1 两个列表中从 开头开始 连续相同元素的数量。
+# <NT> 针对page_size为1的情况。老版本只支持page_size为1.
+#      找出 key0 和 key1 两个列表中从 开头开始 连续相同元素的数量。
 def _key_match_page_size1(key0: List, key1: List):
     i = 0
     for k0, k1 in zip(key0, key1):
@@ -78,7 +83,10 @@ def _key_match_page_size1(key0: List, key1: List):
         i += 1
     return i
 
-
+# <NT> 针对page_size不为1的情况，与_key_match_page_size1类似，
+#      以page_size个token为一个page，两个page间比较，必须要page里面每个token都一致才算是两个page相等.
+#      如page_size=2，有列表abcd和abce，则匹配上的token有ab，即会返回2.
+#      而page_size=1, 匹配上的token就有abc，即会返回3.
 def _key_match_paged(key0: List, key1: List, page_size: int):
     min_len = min(len(key0), len(key1))
 
@@ -92,6 +100,7 @@ def _key_match_paged(key0: List, key1: List, page_size: int):
 
 
 # <NT> RadixCache 基于ReqToTokenPool和BaseTokenToKVPool额外构建的索引
+# page_size: 如为2，表示两个token绑定在一起作为一个page，匹配前缀时以page为单位进行匹配。page间有任意token不一致，则两个page不一致。
 class RadixCache(BasePrefixCache):
     def __init__(
         self,
@@ -357,8 +366,8 @@ class RadixCache(BasePrefixCache):
 
     # <NT> 递归匹配前缀，返回匹配上前缀的部分token的kv_indices，同时返回被匹配上的最后一个节点。
     # 每个节点被访问时，都会更新时间，太长时间未被访问的会淘汰掉。
-    # 每个节点的key是一个列表，包含有一个token id集合，并以集合的首个token id作为词典检索的key。
-    # 先查找待匹配key的首个token是否存在于该节点为基础的子节点中，如不存在可直接结束。
+    # 每个节点的key是一个列表，包含有一个token id集合，并以集合的首个token id作为词典检索的key（当page_size为1时）。
+    # 先查找待匹配key是否存在于该节点为基础的子节点中，如不存在可直接结束。
     # 如存在，进一步看该子节点的key与待匹配的key，从头数，有多长是一致的，即能匹配上的。
     #     如果能匹配上的部分比子节点的key要少，
     #         说明该子节点需要按匹配上的部分进行分裂，把子节点未匹配的部分key分离出来。
@@ -413,7 +422,7 @@ class RadixCache(BasePrefixCache):
 
     # <NT> 外层通过insert函数进入，输入self.root_node，key是token ids，value与key的值一致。
     # 随后该函数会递归调用自身，直到完成插入。
-    # 首先判断该节点的众多子节点中，是否有包含key[0]
+    # 首先判断该节点的众多子节点中，是否有包含key[0](如page_size>1, 则第一个key改成第一个page)
     #    如有：
     #         取出key[0]所在的子节点child，以child为起始点，通过_key_match计算出于key相重叠的部分有多长 prefix_len
     #         如果prefix_len长度等于child节点上的key的总长度：
