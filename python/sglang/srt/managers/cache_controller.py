@@ -309,6 +309,7 @@ class HiCacheController:
                 except Exception as e:
                     logger.error(e)
 
+    # <NT> 采用逐层拷贝的方式进行，以尽可能达到拷贝与计算overlap。
     def load_thread_func_layer_by_layer(self):
         """
         Load KV caches from host memory to device memory layer by layer.
@@ -349,7 +350,7 @@ class HiCacheController:
     # 外部执行了write后，write_queue就会有数据，可以使用write_queue.get获取。
     # _to_op：将数据从device拷贝到host，并推送给write_buffer，外面会从write_buffer里拿数据送给kvcache相关内存中（host->host）
     # write_buffer：TransferBuffer 类型，重叠缓冲区准备操作和传输操作，以提高吞吐量。
-    # 临时变量buffer：用于凑数据，原则时太少的数据先不拷贝，等凑到一定量再拷。如果数据量太大，则需要分开多次拷贝。
+    # 临时变量buffer：用于凑数据，原则时太少的数据先不拷贝，等凑到一定量再拷，以提高拷贝效率。如果数据量太大，则需要分开多次拷贝。
     def write_aux_func(self, no_wait=False):
         """
         Auxiliary function to prepare the buffer for write operations.

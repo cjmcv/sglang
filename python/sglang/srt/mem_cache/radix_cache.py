@@ -41,7 +41,7 @@ class TreeNode:
 
     # <NT> TreeNode.key  : token id
     #      TreeNode.value: token在kvcache的存放位置，kv_indices
-    #      TreeNode.lock_ref        : 引用计数，表示有多少个正在计算的seq用着它。
+    #      TreeNode.lock_ref        : 引用计数，表示有多少个正在计算的req用着它。
     #      TreeNode.last_access_time: 时间标记，用于LRU淘汰策略
     def __init__(self, id: Optional[int] = None):
         self.children = defaultdict(TreeNode)
@@ -179,15 +179,14 @@ class RadixCache(BasePrefixCache):
 
         if value is None:
             value = [x for x in key]
-        return self._insert_helper(self.root_node, key, value)
 
-    # <NT> 当seq结束时调用。
+        return self._insert_helper(self.root_node, key, value)
+    # <NT> 当req结束时调用。
     # if self.disable，即禁用RadixCache，里面的内容与ChunkCache的cache_finished_req函数内容基本一致，直接释放两个pool的相关内容。
     # 如未被disable，则正常使用RadixCache：
-    #     一般调用token_ids会为空，所以算出token_ids会是prompts和decode所有结果的合集。
-    #     按token_ids的长度从req_to_token_pool里取出该seq所有token的kvcache索引。同时执行插入操作，将该seq的所有token_ids插入到
-    # 基数树中，即把新计算得到的未被插入树中的部分添加进去。new_prefix_len一般会是token_ids的长度。与ChunkCache相比，
-    # 主要少了token_to_kv_pool的整体释放，而req_to_token_pool还是要正常释放的。
+    #     token_ids会是prompts和decode所有结果的合集。按token_ids的长度从req_to_token_pool里取出该seq所有token的kvcache索引。
+    # 同时执行插入操作，将该req的新计算得到的未被插入树中的部分添加进去。
+    # new_prefix_len一般会是token_ids的长度。与ChunkCache相比，主要少了token_to_kv_pool的整体释放，而req_to_token_pool还是要正常释放的。
     # 疑问点：为什么要执行这部分的释放，self.token_to_kv_pool.free(kv_indices[len(req.prefix_indices) : new_prefix_len])
     #        在cache_unfinished_req中也有同样的执行情况。
     def cache_finished_req(self, req: Req):
@@ -307,7 +306,7 @@ class RadixCache(BasePrefixCache):
             if len(x.parent.children) == 0:
                 heapq.heappush(leaves, x.parent)
 
-    # <NT> 增加计数，表示正在被使用。
+    # <NT> 增加计数，大于1表示正在被使用。
     # 基于子节点req.last_node，往根节点方向遍历，即会遍历所有前缀节点，所有前缀节点的计数lock_ref都会加1。
     # 如果遍历到某个节点，其本身被标记为lock_ref==0，表示在这之前未被seq所使用，处于可驱逐状态。
     # 而现在需要将其从可驱逐状态转为保护状态，所以evictable_size_会减少，对应protected_size_增加。
@@ -327,7 +326,7 @@ class RadixCache(BasePrefixCache):
             node = node.parent
         return delta
 
-    # <NT> 与inc_lock_ref想对应。
+    # <NT> 与inc_lock_ref相对应。
     def dec_lock_ref(self, node: TreeNode):
         if self.disable:
             return 0

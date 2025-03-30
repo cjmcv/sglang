@@ -28,7 +28,7 @@ KVCache actually holds the physical kv cache.
 # kvcache的管理主要由这三个类组成，
 # ReqToTokenPool管理seq的槽位，负责从seq到token位置的映射，里面存放的元素是seq所属的token在 TokenToKVPoolAllocator 的槽位的索引。
 #               因为token id数值范围很广，不能直接用于内存索引，所以需要动态地将token id转为实际索引，kv_indices。
-# TokenToKVPoolAllocator管理token的槽位，负责从token到实际kvcache内存的映射，里面存放的元素是该token对应的 KVCache 的内存索引。
+# TokenToKVPoolAllocator管理 token 的槽位，负责从 token 到实际 kvcache 内存索引的映射，根据里面存放的数据可以找到任意token对应的 KVCache 的内存块。
 # KVCache管理实际的kvcache内存，通过TokenToKVPoolAllocator拿到的token对应的内存索引，可以取出其对应的kvcache数据。
 # 
 # 除了这三类，还有一类叫HostKVCache(MHA/MLA/DoubleSparse)，管理host端的kvcache内存，除此之外与普通的KVCache不同点还有它兼顾了TokenToKVPoolAllocator的功能，也管理了token的槽位！！关系有点乱。。
@@ -92,7 +92,7 @@ class ReqToTokenPool:
         self.free_slots = list(range(size))
 
     # <NT> 在ScheduleBatch在执行prepare_for_extend时调用。
-    # 遍历所有req，如对应req的pre_len不为0，即该req之前有计算过，有前缀。
+    # 遍历该batch所有req，如对应req的pre_len不为0，即该req之前有计算过，有前缀。
     # 则会把这些前缀的下标都写入到self.req_to_token：self.req_to_token_pool.write( (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices)
     # indices将会是一个二维元组，行是从alloc获得的req空位的下标，列是从0到pre_len的位置上分别写入req.prefix_indices的所有token下标。
     def write(self, indices, values):
@@ -204,7 +204,7 @@ class TokenToKVPoolAllocator:
     # <NT> 在ScheduleBatch.prepare_for_extend中调用 out_cache_loc = self.alloc_token_slots(extend_num_tokens)，
     #      need_size=extend_num_tokens，对应的是新构建的batch中当前当前需要做extend计算的token数,
     #      按token数申请空槽位，返回的是充当下标的tensor，在set_kv_buffer函数中作为loc参数输入，
-    #      里面每个元素表示的是token存放的下标，对应该轮ScheduleBatch计算的输出结果。
+    #      里面每个元素表示的是token的kvcache存放的下标，对应该轮ScheduleBatch计算的输出结果。
     #      普通mha的kvcache维度是[layer_id][token][head_num*head_dim]，这里返回的是空闲的kvcache id集合，与token一一对应。
     def alloc(self, need_size: int):
         if need_size > len(self.free_slots):
