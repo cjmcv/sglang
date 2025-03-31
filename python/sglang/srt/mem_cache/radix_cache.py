@@ -224,6 +224,7 @@ class RadixCache(BasePrefixCache):
         self.req_to_token_pool.free(req.req_pool_idx)
         self.dec_lock_ref(req.last_node)
 
+    # <NT> 当req未结束时调用。
     def cache_unfinished_req(self, req: Req):
         """Cache request when it is unfinished."""
         if self.disable:
@@ -419,8 +420,7 @@ class RadixCache(BasePrefixCache):
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
         return new_node
 
-    # <NT> 外层通过insert函数进入，输入self.root_node，key是token ids，value与key的值一致。
-    # 随后该函数会递归调用自身，直到完成插入。
+    # <NT> 外层通过insert函数进入。随后该函数会递归调用自身，直到完成插入。
     # 首先判断该节点的众多子节点中，是否有包含key[0](如page_size>1, 则第一个key改成第一个page)
     #    如有：
     #         取出key[0]所在的子节点child，以child为起始点，通过_key_match计算出于key相重叠的部分有多长 prefix_len

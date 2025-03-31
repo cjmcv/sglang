@@ -84,6 +84,9 @@ class HiRadixCache(RadixCache):
             height += 1
         return height
 
+    # <NT> 将要写的数据通过cache_controller提交到队列中，返回host内存的索引，并标记到node.host_value中。
+    # 如果没有返回索引，则表示host的内存池里没有空槽位，需要先清除掉一些数据挪腾位置出来，再进行上面的操作。
+    # 因为是异步拷贝，所以使用ongoing_write_through去记录正在拷贝的节点，拷贝结束再清除。
     def write_backup(self, node: TreeNode):
         host_indices = self.cache_controller.write(
             device_indices=node.value,
@@ -104,6 +107,7 @@ class HiRadixCache(RadixCache):
 
         return len(host_indices)
 
+    # <NT> 在_insert_helper中调用，自增该节点的命中次数，当达到阈值并且host_value为空时，将数据从显存拷贝到内存。
     def inc_hit_count(self, node: TreeNode):
         if self.cache_controller.write_policy != "write_through_selective":
             return
@@ -112,6 +116,11 @@ class HiRadixCache(RadixCache):
             self.write_backup(node)
             node.hit_count = 0
 
+    # <NT> 检查清理 write_backup 中启动的已完成的写回操作。
+    # 1）基于ack_write_queue的qsize构建一个tensor (queue_size)，其元素只有一个值，表示队列大小。
+    # 2）调用all_reduce，对queue_size执行 ReduceOp.MIN 的 allreduce操作，
+    #    取所有TP节点中队列大小的最小值作为统一的队列大小。这样可以保证在更新基数缓存（radix cache）时，所有进程的操作是同步的。
+    # 3）按统一的队列大小去逐个 dec_lock_ref 和 del self.ongoing_write_through。
     def writing_check(self):
         queue_size = torch.tensor(
             self.cache_controller.ack_write_queue.qsize(), dtype=torch.int
@@ -128,6 +137,7 @@ class HiRadixCache(RadixCache):
             self.dec_lock_ref(self.ongoing_write_through[ack_id])
             del self.ongoing_write_through[ack_id]
 
+    # <NT> 对已完成的加载操作进行清理，包括复位node的.loading变量，删除 ongoing_load_back 元素。
     def loading_check(self):
         while not self.cache_controller.ack_load_queue.empty():
             try:
@@ -146,6 +156,10 @@ class HiRadixCache(RadixCache):
     def evictable_size(self):
         return self.evictable_size_
 
+    # <NT> 大体与 RadixCache.evict 一样，先收集树的叶子节点构建小顶堆，并从小到大逐个pop出，进行检索。
+    # 主要差别在 if x.host_value 部分，这里的 write_policy 目前版本默认是 "write_through_selective"，
+    # 如果 x 的数据没有被写入到 host 端，则直接释放显存并删除节点。
+    # 如果 x 的数据有被写入到 host 端，则删除device数据，保留host端备份。
     def evict(self, num_tokens: int):
         leaves = self._collect_leaves_device()
         heapq.heapify(leaves)
@@ -186,6 +200,8 @@ class HiRadixCache(RadixCache):
                 self.writing_check()
                 time.sleep(0.1)
 
+    # <NT> 释放有host端数据的节点，调用 evict_device 对节点的 device侧数据做释放。
+    # 释放后 node.value = None，节点仍存在于树里，后续访问到这种节点，会得到 node.evicted 为 True。
     def _evict_write_through(self, node: TreeNode):
         # evict a node already written to host
         num_evicted = self.cache_controller.evict_device(node.value, node.host_value)
@@ -194,6 +210,7 @@ class HiRadixCache(RadixCache):
         node.value = None
         return num_evicted
 
+    # <NT> 释放没有host端数据的节点
     def _evict_write_through_selective(self, node: TreeNode):
         # evict a node not initiated write to host
         self.cache_controller.mem_pool_device_allocator.free(node.value)
@@ -201,6 +218,7 @@ class HiRadixCache(RadixCache):
         self._delete_leaf(node)
         return num_evicted
 
+    # <NT> 在 write_backup 中调用，释放host端的空槽位。只释放evicted的节点。
     def evict_host(self, num_tokens: int):
         leaves = self._collect_leaves()
         heapq.heapify(leaves)
@@ -224,6 +242,8 @@ class HiRadixCache(RadixCache):
             if len(x.parent.children) == 0 and x.parent.evicted:
                 heapq.heappush(leaves, x.parent)
 
+    # <NT> write_backup相对应，从host端加载数据到device端。
+    # write_backup是单节点写，load_back是以last_node为起点，往parent方向的整条前缀路径的所有节点的加载。
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None
     ) -> Optional[torch.Tensor]:
@@ -276,6 +296,8 @@ class HiRadixCache(RadixCache):
 
         return device_indices
 
+    # <NT> 从host端把数据加载回device端。开头使用if last_node.evicted过滤，
+    # 因为该功能只适用于host端有备份而device数据已删除的情况
     def init_load_back(
         self,
         last_node: TreeNode,
@@ -288,7 +310,7 @@ class HiRadixCache(RadixCache):
         if last_node.evicted:
             loading_values = self.load_back(last_node, mem_quota)
             if loading_values is not None:
-                prefix_indices = (
+                prefix_indices = ( 
                     loading_values
                     if len(prefix_indices) == 0
                     else torch.cat([prefix_indices, loading_values])
@@ -367,6 +389,16 @@ class HiRadixCache(RadixCache):
         new_node.parent.children[key[0]] = new_node
         return new_node
 
+    # <NT> 节点插入的关键函数，可以先看RadixCache的_insert_helper注释。
+    # 先查看待插入的token能否找到直接对应上的节点(pagesize为1，节点以key[0]作为词典的key)
+    # 如果有:
+    #   看前缀长度是否等于要插入的token。
+    #   如果等于，即是能全匹配该节点：
+    #     查看节点是否为evicted，
+    #     如果是，表示该节点的device数据已经被同步到了host端。需要重新填充device数据，并更新host对应位置的状态。
+    #     否则执行inc_hit_count表示该节点被命中次数+1，达到阈值后会被备份到host。
+    #     并继续把待插入token剩下部分递归执行插入操作。
+    #   否则是部分匹配，则需要分裂节点
     def _insert_helper(self, node: TreeNode, key: List, value):
         node.last_access_time = time.time()
         if len(key) == 0:
@@ -381,8 +413,8 @@ class HiRadixCache(RadixCache):
                     # change the reference if the node is evicted
                     # this often happens in the case of KV cache recomputation
                     child.value = value[:prefix_len]
-                    self.token_to_kv_pool_host.update_synced(child.host_value)
                     self.evictable_size_ += len(value[:prefix_len])
+                    self.token_to_kv_pool_host.update_synced(child.host_value)
                     return self._insert_helper(
                         child, key[prefix_len:], value[prefix_len:]
                     )

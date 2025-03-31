@@ -510,6 +510,8 @@ class HiCacheController:
                         self.ack_load_queue.put(node_id)
         aux_thread.join()
 
+    # <NT> 先确定数据是否已经同步到了host端。然后释放device端token槽位，
+    # 并将mem_pool_host对应位置的状态改为MemoryStateInt.BACKUP，表示为device侧提供数据备份。
     def evict_device(
         self, device_indices: torch.Tensor, host_indices: torch.Tensor
     ) -> int:

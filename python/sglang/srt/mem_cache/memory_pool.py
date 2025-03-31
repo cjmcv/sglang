@@ -642,6 +642,7 @@ class DoubleSparseTokenToKVPool(KVCache):
 
 # <NT-TODO> PROTECTED: 
 #      SYNCED: 从host到device已经同步好
+#      BACKUP：从device到host端已经备份好
 class MemoryStateInt(IntEnum):
     IDLE = 0
     RESERVED = 1
