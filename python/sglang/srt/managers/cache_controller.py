@@ -310,6 +310,8 @@ class HiCacheController:
                     logger.error(e)
 
     # <NT> 采用逐层拷贝的方式进行，以尽可能达到拷贝与计算overlap。
+    # batch_operation.host_indices 是该轮加载的所有节点的所有indices。
+    # 需要对其进行get_flat_data_by_layer切片后才能按层提取。
     def load_thread_func_layer_by_layer(self):
         """
         Load KV caches from host memory to device memory layer by layer.

@@ -206,6 +206,7 @@ class DeepseekV2MoE(nn.Module):
 
         self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
 
+        # <NT> deepseek开源的deepep方案 / 原生的EP方案 / 原生的FusedMoE的TP方案
         MoEImpl = (
             DeepEPMoE
             if global_server_args_dict["enable_deepep_moe"]
@@ -1185,13 +1186,13 @@ class DeepseekV2DecoderLayer(nn.Module):
 #       -> forward_absorb 权重吸收，
 #    -> RMSNorm
 #    -> DeepseekV2MoE + DeepseekV2MLP组合 (由first_k_dense_replace和moe_layer_freq两个参数控制组合情况,在V3和R1里都是分别为3和1) 
-#          <DeepseekV2MoE>
+#       <DeepseekV2MoE>
 #       -> shared_experts (DeepseekV2MLP类型，共享部分，每个样本都会进入计算)
 #       -> MoEGate        (门控网络，选择专家)
 #       -> experts, 有 EPMoE    (专家并行，一个节点存放部分专家) 
 #                   或 FusedMoE（所有专家混合在一起，然后用TP拆分每个专家网络的权重，打包做gemm）
 #       -> all reduce 专家结果 （无论是EP还是TP）
-#          <DeepseekV2MLP>
+#       <DeepseekV2MLP>
 #       ->  gate_up_proj - MergedColumnParallelLinear
 #       ->  act_fn       - SiluAndMul
 #       ->  down_proj    - RowParallelLinear - all reduce

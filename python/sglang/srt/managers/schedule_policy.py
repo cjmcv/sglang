@@ -478,6 +478,8 @@ class PrefillAdder:
                 and req.last_node_global is not None
                 and req.last_node_global.evicted
             ):
+                # <NT> 在get_new_batch_prefill里调用的加载，离真正计算还有一定时延，
+                # 所以第一层的加载与这部分时延重叠，后续层的加载和上一层的计算重叠。
                 req.last_node, req.prefix_indices = self.tree_cache.init_load_back(
                     req.last_node_global, req.prefix_indices
                 )

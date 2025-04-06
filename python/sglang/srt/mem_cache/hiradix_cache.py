@@ -263,6 +263,8 @@ class HiRadixCache(RadixCache):
         # protect the ancestor nodes from eviction
         delta = self.inc_lock_ref(ancester_node)
 
+        # <NT> nodes_to_load是所有需要加载的节点，得到的host_indices则包含有多有节点的indices.
+        # 分层加载是基于 host_indices 切片后进行的。
         # load it all or not at all
         host_indices = torch.cat([n.host_value for n in nodes_to_load])
         if len(host_indices) < self.load_back_threshold or (

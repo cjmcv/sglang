@@ -324,12 +324,17 @@ class ReplicatedLinear(LinearBase):
 
 # <NT> 注释说第一维是输入，第二维是输出。而nn.Linear中的是(out_features, in_features), 与之相反，需要注意。
 #      所以这里切分是按矩阵A不做转置的正常矩阵乘法来算的，in_features是GEMM的K。
-#      MQ: 但是在构建weight时数据是(out_features, in_features)的，什么时候做过转置了？
+#      问: 但是在构建weight时数据是(out_features, in_features)的，什么时候做过转置了？
 #      答: 加载前后都没做转置，可以简单理解成ColumnParallelLinear的列切分，实际是GEMM的列，nn.linear的行。对于实际的nn.Linear的权重实际上是行切分。
 #          换句话说ColumnParallelLinear是对out_features做切分，RowParallelLinear是对in_features做切分。
 #          具体例子看下面RowParallelLinear的weight_loader函数注释。
 #          另外对于nn.Linear权重充当gemm的B时，要么先转置，要么以B矩阵为列优先的方式进行。
 #          (out_features, in_features)标记为列优先，即相当于行优先的(in_features, out_features).
+#      问：列切分为什么要求输入是未做切分的。
+#      答：因为两个线性层之间存在一个激活函数，激活函数非线性，所以要求输入应该是完整的不做切分的。
+#          如果切分激活值X，两节点输出需要叠加，则Y = GeLU(X1A1 + X2A2)，而激活函数GELU是非线性的GeLU(X1A1+X2A2) ！= GeLU(X1A1)+GeLU(X2A2)，
+#          所以如果要切分X，需要先执行all-reduce，才能进入激活函数。
+#          如果不切分X，可以直接进入激活函数，同时不需要执行all-gather，因为行并行要求输入是切分好的，只需要在行并行后面加一个all-reduce即可。
 class ColumnParallelLinear(LinearBase):
     """Linear layer with column parallelism.
 
@@ -795,7 +800,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 # 因为是基于列并行，即每个节点的输入数据是完整的，且会按head切分 (输出维度n)。
 # 如节点0负责w_q的h0和h1部分，w_k的h4，w_v的h6, 
 #   节点1负责w_q的h2和h2部分，w_k的h5，w_v的h7
-# head切分，各个节点独立计算，（不需要交互，TODO: kvcache也自己管自己的？）
+# head切分，各个节点独立计算，kvcache也是按head进行读取 [layer_num][token_num][head_num][head_dim]
 #
 # 问：为什么说当对应MQA和GQA这种q头数比k/v头数多的情况下，可能需要将k/v head复制多份。
 # 答：因为一个kv head对应多个q head，比如qh0-qh3对应kvh0，qh4-qh7对应kvh1，
