@@ -39,6 +39,13 @@ if _is_hip:
 logger = logging.getLogger(__name__)
 
 
+# <NT> RMSNorm 跟常说的layernorm一样，也是逐个layer做归一化，但与标准layernorm算法的公式不同。
+# RMSNorm可以看成是简化版的layernorm。
+# 标准的layernorm是对每个样本在特征维度上进行归一化，计算均值和方差，并对输入进行缩放和平移
+# 而RMSNorm仅对输入进行缩放，而不计算均值，通过均方根（Root Mean Square）来规范化输入。
+# 输入维度[batch_size, seq_len, num_hiddens]，对于layernorm，num_hiddens维度必须完整，而seq_len维度可以切分（序列并行）。
+# 所以Linear行并行后需要做allreduce才能进非并行版本的RMSNorm(不同节点做相同计算)，又或者是需要做reduce-scatter后进行序列并行的RMSNorm。
+@register_custom_op("sglang_rmsnorm")
 class RMSNorm(CustomOp):
     def __init__(
         self,

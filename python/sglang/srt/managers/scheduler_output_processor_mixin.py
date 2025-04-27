@@ -20,6 +20,11 @@ class SchedulerOutputProcessorMixin:
     We put them into a separate file to make the `scheduler.py` shorter.
     """
 
+    # <NT> prefill/extend的结果都归该函数处理
+    # 生成模型的结果是GenerationBatchResult，里面有
+    # 1.模型输出分数logits_output。
+    # 2.下次需要推理的next_token_ids。
+    # 3.ScheduleBatch的id号(全局变量，在get_model_worker_batch里赋值)。
     def process_batch_result_prefill(
         self,
         batch: ScheduleBatch,
@@ -58,7 +63,8 @@ class SchedulerOutputProcessorMixin:
                         )
 
             hidden_state_offset = 0
-
+			
+			# <NT> 根据该batch的输出，判断里面有哪些req满足结束条件，需要从batch里退出来。
             # Check finish conditions
             logprob_pt = 0
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
@@ -71,6 +77,8 @@ class SchedulerOutputProcessorMixin:
                     self.token_to_kv_pool_allocator.free(batch.out_cache_loc[j : j + 1])
                     continue
 
+				# <NT> is_being_chunked <= 0, 表示该req的prefill/extend阶段已完成，正在进行的是decode阶段，
+                #      可以开始使用req.output_ids接收decode输出结果，并判断结束条件。
                 if req.is_chunked <= 0:
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
@@ -174,6 +182,7 @@ class SchedulerOutputProcessorMixin:
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
+	# <NT> 意味着该batch的所有req都不处于prefill/extend阶段。
     def process_batch_result_decode(
         self,
         batch: ScheduleBatch,

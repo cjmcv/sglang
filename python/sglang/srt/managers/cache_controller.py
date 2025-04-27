@@ -26,7 +26,8 @@ from sglang.srt.mem_cache.memory_pool import HostKVCache, TokenToKVPoolAllocator
 
 logger = logging.getLogger(__name__)
 
-
+# <NT> 在进行逐层从host加载数据到device时使用。
+# 使用了条件变量，在加载完成后调用increment，调用get_key_buffer/get_value_buffer消费时调用wait_until。
 class LayerDoneCounter:
     def __init__(self, num_layers):
         self.counter = num_layers
@@ -46,7 +47,10 @@ class LayerDoneCounter:
         with self.condition:
             self.counter = 0
 
-
+# <NT> 缓存管理操作，里面将host_indices和device_indices相关联。
+# merge: 将其他CacheOperation合并进来，包括索引/优先级和节点id，用于批量处理。
+# split：将CacheOperation拆分成多个小的，以减小中间buffer的大小。
+#       factor是分裂系数，需要大于1，如为2，则对半分成两个，为5则每份是1/5，分成5份。
 class CacheOperation:
 
     counter = 0
@@ -99,7 +103,8 @@ class CacheOperation:
     def __lt__(self, other: "CacheOperation"):
         return self.priority < other.priority
 
-
+# <NT> TransferBuffer, 重叠缓冲区准备操作和传输操作，以提高吞吐量。
+# stop_event 会是一个threading.Event()，用于停止推送数据。
 class TransferBuffer:
     """
     Overlapping buffer preparation and transfer operations to improve throughput.
@@ -170,6 +175,7 @@ class HiCacheController:
         ]:
             raise ValueError(f"Invalid write policy: {write_policy}")
 
+        # <NT> PriorityQueue：是一个优先队列，入队的元素会被赋予一个优先级，出队时优先级最高的元素会最先被取出。
         self.write_queue = PriorityQueue()
         self.load_queue = PriorityQueue()
 
@@ -226,6 +232,10 @@ class HiCacheController:
         self.write_thread.start()
         self.load_thread.start()
 
+    # <NT> 从host端分配token空槽位，并将这些新的空槽位保护起来，因为拷贝是异步的，以免中途再次被修改。
+    # 将host_indices和device_indices使用CacheOperation关联起来，表示这是同一批数据。
+    # 需要将host_indices上的host数据转移到device_indices上的device显存中。
+    # write执行后，write_queue会有数据，而初始化时创建的write_thread就会接收到数据，异步执行拷贝操作。
     def write(
         self,
         device_indices: torch.Tensor,
@@ -244,6 +254,8 @@ class HiCacheController:
         )
         return host_indices
 
+    # <NT> 与上面的write相对应，用于将数据从host端加载数据到device。
+    # load对应load_queue, 对应load_thead.
     def load(
         self,
         host_indices: torch.Tensor,
@@ -311,6 +323,9 @@ class HiCacheController:
                 except Exception as e:
                     logger.error(e)
 
+    # <NT> 采用逐层拷贝的方式进行，以尽可能达到拷贝与计算overlap。
+    # batch_operation.host_indices 是该轮加载的所有节点的所有indices。
+    # 需要对其进行get_flat_data_by_layer切片后才能按层提取。
     def load_thread_func_layer_by_layer(self):
         """
         Load KV caches from host memory to device memory layer by layer.
@@ -356,6 +371,11 @@ class HiCacheController:
                     if node_id != 0:
                         self.ack_load_queue.put(node_id)
 
+    # <NT> 为写入操作准备缓冲区。写入是device为主体，写入到host端。
+    # 外部执行了write后，write_queue就会有数据，可以使用write_queue.get获取。
+    # _to_op：将数据从device拷贝到host，并推送给write_buffer，外面会从write_buffer里拿数据送给kvcache相关内存中（host->host）
+    # write_buffer：TransferBuffer 类型，重叠缓冲区准备操作和传输操作，以提高吞吐量。
+    # 临时变量buffer：用于凑数据，原则时太少的数据先不拷贝，等凑到一定量再拷，以提高拷贝效率。如果数据量太大，则需要分开多次拷贝。
     def write_aux_func(self, no_wait=False):
         """
         Auxiliary function to prepare the buffer for write operations.
@@ -373,25 +393,30 @@ class HiCacheController:
         with torch.cuda.stream(self.write_stream):
             while not self.stop_event.is_set():
                 try:
+                    # <NT> 每次都会从write_queue取出一份数据
                     operation = self.write_queue.get(block=True, timeout=1)
                     factor = (
                         len(operation.device_indices)
                         // self.write_buffer.max_buffer_size
                     )
 
+                    # <NT> 根据数据量，判断如何使用buffer。
                     if factor >= 1:
+                        # <NT> 到了这里，说明数据量比较大了，可以先把之前攒下的buffer里的数据先拷贝到host。
                         if buffer is not None:
                             _to_op(buffer)
                             buffer = None
-
+                        # <NT> 数据量虽然大，但又没有非常大，可以直接拷贝过去，不用跟其他数据凑在一起再拷贝。
                         if factor < 2:
                             _to_op(operation)
                         else:
+                            # <NT> 数据量太大了，需要分裂成多份，再逐份拷贝，以免造成传输的中间buffer过大。
                             split_ops = operation.split(factor)
                             for op_ in split_ops:
                                 _to_op(op_)
                         continue
 
+                    # <NT> 来到这里说明数据量还比较小，先往buffer里凑一下，等攒够一定数据量后再一起拷贝。
                     if buffer is None:
                         buffer = operation
                     else:
@@ -409,6 +434,7 @@ class HiCacheController:
                 except Exception as e:
                     logger.error(e)
 
+    # <NT> 基本思路与write_aux_func接近，会根据数据量攒数据。
     def load_aux_func(self):
         """
         Auxiliary function to prepare the buffer for load operations.
@@ -468,6 +494,10 @@ class HiCacheController:
             except Exception as e:
                 logger.error(e)
 
+    # <NT> 单独一个线程，在初始化时启动，device端持续写数据到host端。
+    # write_buffer中取出来的数据是host端的，因为write_aux_func里的_to_op操作会将数据转移到host端。
+    # 再put到write_buffer。mem_pool_host.assign_flat_data就仅仅是一个host到host的拷贝操作。
+    # complete_io是标记内存状态为已完成同步。
     def write_thread_func_buffer(self):
         aux_thread = threading.Thread(target=self.write_aux_func, daemon=True)
         aux_thread.start()
@@ -483,6 +513,12 @@ class HiCacheController:
                     self.ack_write_queue.put(node_id)
         aux_thread.join()
 
+    # <NT> 与write_thread_func_buffer函数对应，device端持续从host端读取数据
+    # load_buffer中的数据是host端的，需要从host端加载到device。
+    # transfer函数里数据会有to(self.device), 所以 mem_pool_device调用是拷贝到device，mem_pool_host调用是拷贝到host
+    # 但是！
+    # 该函数没有被调用，而使用了 load_thread_func_layer_by_layer 代替，因为只有要准备使用时，才会从host端往device端加载数据，对时间要求会比较高。
+    # 需要逐层拷贝传输，以免后面的数据堵塞了前面的计算。
     def load_thread_func_buffer(self):
         aux_thread = threading.Thread(target=self.load_aux_func, daemon=True)
         aux_thread.start()
@@ -499,6 +535,8 @@ class HiCacheController:
                         self.ack_load_queue.put(node_id)
         aux_thread.join()
 
+    # <NT> 先确定数据是否已经同步到了host端。然后释放device端token槽位，
+    # 并将mem_pool_host对应位置的状态改为MemoryStateInt.BACKUP，表示为device侧提供数据备份。
     def evict_device(
         self, device_indices: torch.Tensor, host_indices: torch.Tensor
     ) -> int:

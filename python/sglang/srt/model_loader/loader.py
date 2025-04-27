@@ -139,7 +139,10 @@ def _get_quantization_config(
         return quant_config
     return None
 
-
+# <NT> 1. 从ModelConfig中获取模型架构名，并根据名字从ModelRegistry取出注册了的对应模型类，
+#         如Qwen2ForCausalLM，DeepseekV3ForCausalLM，而模型的注册是在模型定义文件里，通过EntryClass进行的。
+#      2. 获取量化配置信息。
+#      3. 通过模型类，创建模型对象，并返回。
 def _initialize_model(
     model_config: ModelConfig,
     load_config: LoadConfig,
@@ -177,7 +180,7 @@ class BaseModelLoader(ABC):
         """Load a model with the given configurations."""
         raise NotImplementedError
 
-
+# <NT> 从模型文件读取权重数据到内存。
 class DefaultModelLoader(BaseModelLoader):
     """Model loader that can load different file types from disk."""
 
@@ -311,6 +314,9 @@ class DefaultModelLoader(BaseModelLoader):
 
         return hf_folder, hf_weights_files, use_safetensors
 
+    # <NT> 读取模型文件得到可迭代对象类型的权重数据。
+    # 1. _prepare_weights，检查模型文件是否存在，不存在则从modelscope下载，并做一些清理工作。
+    # 2. 具体的读取操作，从文件到内存。
     def _get_weights_iterator(
         self, source: "Source"
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
@@ -360,6 +366,12 @@ class DefaultModelLoader(BaseModelLoader):
             model_config.model_path, model_config.revision, fall_back_to_pt=True
         )
 
+    # <NT> 加载模型的主入口: 路径是ModelRunner(__init__ -> load_model -> get_model -> 获取ModelLoader -> DefaultModelLoader(load_model, 即此函数)
+    # 1. 使用_initialize_model创建模型类对象，在模型对象初始化时，会对里面的所有层也进行初始化，
+    #  包括内存/显存的创建。如qwen2-1.5B在创建完模型对象后就占用了3G+的显存。
+    # 2. _get_all_weights, 读取得到weight的可迭代对象
+    # 3. model.load_weights, 基于模型类对象将可迭代对象权重加载到模型对象的具体位置上，如DeepseekV2ForCausalLM的load_weights。
+    # 4. quant_method.process_weights_after_loading, 遍历模型对象里的所有量化模块，把量化方法的权重预处理都执行一遍.
     def load_model(
         self,
         *,
@@ -1205,6 +1217,8 @@ class GGUFModelLoader(BaseModelLoader):
         # hack: ggufs have a different name than transformers
         if model_type == "cohere":
             model_type = "command-r"
+        # <NT> 找到模型对应架构，如value是qwen2和deepseek2，需和model_type一致。key是MODEL_ARCH.QWEN2: 17 / MODEL_ARCH.QWEN2: 17
+        # 进而得到name_map, gguf有自己的命名规则，需要用这个map将huggingface的名字转变为gguf的名字。
         arch = None
         for key, value in gguf.MODEL_ARCH_NAMES.items():
             if value == model_type:
@@ -1218,6 +1232,7 @@ class GGUFModelLoader(BaseModelLoader):
             dummy_model = AutoModelForCausalLM.from_config(config)
         state_dict = dummy_model.state_dict()
 
+        # <NT> 将hugging的名字转为gguf的名字
         gguf_to_hf_name_map = {}
         for hf_name in state_dict:
             name, suffix = hf_name.rsplit(".", 1)
