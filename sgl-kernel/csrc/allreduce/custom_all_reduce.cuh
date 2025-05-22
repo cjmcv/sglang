@@ -17,10 +17,16 @@
 
 namespace vllm {
 
+// <NT> 36个block，每个block默认512个线程。
+// 
 constexpr int kMaxBlocks = 36;
 // Counter may overflow, but it's fine since unsigned int overflow is
 // well-defined behavior.
 using FlagType = uint32_t;
+// <NT> 两份peer counter集，分别对应两次同步操作.
+// 因为当当前 GPU 线程块尚未通过第一个同步点时，对等 GPU 线程块有可能已到达第二个同步点。
+// 因此，当当前 GPU 正忙于等待计数器更新时，对等 GPU 可能已将计数器递增为 counter+1。
+// 所以使用交替计数器数组来消除这种潜在冲突。
 struct Signal {
   alignas(128) FlagType self_counter[kMaxBlocks][8];
   // Two sets of peer counters are needed for two syncs. The reason is that
@@ -31,14 +37,19 @@ struct Signal {
   alignas(128) FlagType peer_counter[2][kMaxBlocks][8];
 };
 
+// <NT> 8份，对应最多的8个GPU
 struct __align__(16) RankData {
   const void* __restrict__ ptrs[8];
 };
 
+// <NT> 同步信号，最多8个gpu，每个gpu有两份peer_counters
 struct __align__(16) RankSignals {
   Signal* signals[8];
 };
 
+// <NT> alignof用于查询类型或变量的对齐要求, 如alignof(float)为4。
+// 构建一个 alignof(T) * sz 字节对齐的静态数组data，
+// 因为sz是模板参数，在编译阶段就被确定，所以T data[sz]是静态数组。
 // like std::array, but aligned
 template <typename T, int sz>
 struct __align__(alignof(T) * sz) array_t {
@@ -47,6 +58,9 @@ struct __align__(alignof(T) * sz) array_t {
   static constexpr int size = sz;
 };
 
+// <NT> 对齐是alignof(T)*sz，
+// 则P是alignof(T) * 16 / sizeof(T), 就是16字节对齐，共128位，方便生成ld.128和st.128，从gmem或smem读取/写入。
+// 而A是alignof(float) * 16 / sizeof(T)，如果T是2字节，则A是256位，如果T是4字节float，则是128位。
 // use packed type to maximize memory efficiency
 // goal: generate ld.128 and st.128 instructions
 template <typename T>
@@ -57,6 +71,7 @@ struct packed_t {
   using A = array_t<float, 16 / sizeof(T)>;
 };
 
+// <NT> 确保高频函数强制inline调用
 #define DINLINE __device__ __forceinline__
 
 // scalar cast functions
@@ -96,6 +111,7 @@ DINLINE nv_bfloat16& assign_add(nv_bfloat16& a, nv_bfloat16 b) {
 }
 #endif
 
+// <NT> 一份小数组的加法操作
 template <typename T, int N>
 DINLINE array_t<T, N>& packed_assign_add(array_t<T, N>& a, array_t<T, N> b) {
 #pragma unroll
@@ -133,6 +149,12 @@ DINLINE O downcast(array_t<float, O::size> val) {
   }
 }
 
+// <NT> 在全局内存执行 原子释放存储 操作，用于同步机制，st_flag_release和ld_flag_acquire对应。
+// 一般用于生产者消费者模式，如写线程：完成关键数据写入后，使用释放语义设置标志。读线程：通过获取语义等待标志，确保看到最新数据
+// st(存储指令), release(确保之前的所有内存操作完成), sys(系统内存屏障), global(操作全局内存)
+// "r"：通用寄存器（32 位或 64 位，取决于架构），"r"(flag)表示flag 必须在通用寄存器中
+// "l"：64 位地址寄存器（专用于内存寻址），ARM GCC的"l" 也用于 64 位值，"l"(flag_addr)表示flag_addr必须是 64 位地址值
+// "n"：立即数常量（如offset）
 static DINLINE void st_flag_release(FlagType* flag_addr, FlagType flag) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
   asm volatile("st.release.sys.global.u32 [%1], %0;" ::"r"(flag), "l"(flag_addr));
@@ -151,6 +173,7 @@ static DINLINE FlagType ld_flag_acquire(FlagType* flag_addr) {
   return flag;
 }
 
+// <NT> 普通的存指令，通过volatile禁止编译器优化和重排。
 static DINLINE void st_flag_volatile(FlagType* flag_addr, FlagType flag) {
   asm volatile("st.volatile.global.u32 [%1], %0;" ::"r"(flag), "l"(flag_addr));
 }
@@ -161,6 +184,18 @@ static DINLINE FlagType ld_flag_volatile(FlagType* flag_addr) {
   return flag;
 }
 
+// <NT> sg是所有GPU的同步信号，self_sg是当前GPU自己的那一份，其实也包含在sg里，只是单独被指了出来。
+// threadIdx.x对应一个gpu，8个gpu则只有0-7号起作用。
+// blockIdx.x做第一维度索引，一个线程块负责一个块的数据拷贝，如果该block的0-7号线程对应的计数器都同步上了，则说明各个gpu上该block对应数据块已拷贝完毕。
+// 同步信号是整个通信类的成员变量，这样做可以防止，使用该通信类循环做多次通信时，因GPU通信轮次不一致，导致数据有误。
+//   按API调用方式：all_reduce(custom_ptr, inp1, out1, buffer_ptrs[rank], max_size)，buffer_ptrs已注册，循环调用时用的是同一个buffer（不同的输入也会被拷贝到该buffer）。
+//   如GPU_A完成了第一轮allreduce，想进入了第二轮通信，而GPU_B还在处理第一轮，因为如果两轮通信用的是同一份buffer，GPU_A在进入第二轮时没有等待GPU_A的第一轮结束，
+// GPU_B在第二轮开头就会覆盖IPC buffer(sgl-kernel/csrc/allreduce/custom_all_reduce.cu -> all_reduce -> cudaMemcpyAsync)，导致GPU_A的第一轮数据有冲突。
+// 而且barrier以block为单位，即表示要执行的block达到同步要求即可执行该blokc的下一轮通信，不需要等待整体都完成了才开始，是个细粒度的栅栏。
+//   如果按api的调用方式：all_reduce(custom_ptr, inp1, out1, None, max_size)，inp1需要是已注册的，同一份输入循环调用时用的是同一个buffer，情况同上。而如果是不同位置的inp1，
+// 属于不同地址，则多轮计算则无关联，不再需要同步？除非很多轮后又碰到了同一个位置的相同地址的inp1。barrier应针对同一地址进行同步，不应该放到整体api上？
+// 
+// 注意while 内会持续占用GPU资源，如果单卡使用多进程或多线程进行模拟，while循环占用GPU资源可能会导致另外一个线程无法完成计算，导致难以完成同步。
 // is_start: whether this is the very first synchronization barrier.
 // need_fence: whether a memory fence is needed. If true, a release-acquire
 // semantic is used to enforce memory access order before and after this
@@ -190,6 +225,10 @@ DINLINE void multi_gpu_barrier(const RankSignals& sg, Signal* self_sg, int rank)
   if constexpr (is_start || need_fence) __syncthreads();
 }
 
+// <NT> ptrs包含所有rank的待通信数据的对等共享内存，第一维下标是rank_id，第二维是实际通信数据。
+// P是实际通信的数据类型，A是allreduce叠加操作的float类型。
+// upcast(ptrs[i][idx]) 会将数据转换成A的float类型，然后每个元素是一个128位的小数组，每个rank的对应点相累加，
+// 累加完后降回到原始类型，输出给output。因为output是本地地址，每个rank都会进行这个操作，得到的output也会完全一致，不需要额外分发。
 template <typename P, int ngpus, typename A>
 DINLINE P packed_reduce(const P* ptrs[], int idx) {
   A tmp = upcast(ptrs[0][idx]);
@@ -200,6 +239,10 @@ DINLINE P packed_reduce(const P* ptrs[], int idx) {
   return downcast<P>(tmp);
 }
 
+// <NT> __launch_bounds__(maxThreadsPerBlock, minBlocksPerMultiprocessor)指明线程块尺寸和资源占用的约束信息。
+// maxThreadsPerBlock：最大允许的线程数是512，而这里allreduce函数默认的也是512。
+// minBlocksPerMultiprocessor：每个SM必须能同时驻留的最小线程块数。不确定这里的用意？
+// multi_gpu_barrier是为了多轮通信下的多个GPU的进展同步，比如有两轮通信，当前GPU完成了第一轮会马上开始准备第二轮，在第二轮计算前，发现其他GPU还在第一轮通信中，会进行等待。
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(
     RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size) {
@@ -221,6 +264,10 @@ DINLINE P* get_tmp_buf(Signal* sg) {
   return (P*)(((Signal*)sg) + 1);
 }
 
+// <NT> RingAllReduce的实现版本：ScatterReduce + Allgather
+// A[123456] B[abcdef] C[ijklmn] 数据被分成三部分: A[12,34,56] B[ab,cd,ef] C[ij,kl,mn]
+// A的part是0号，B的是1号，C是2号. 做allreduce后，A进行针对0号part得到[12abij,34,56], B[ab,34cdkl,ef], C[ij,kl,56efmn]，每个rank都有一个part的完整数据，
+// 然后allgather，A需要从B拿到1号part，从C拿到2号part，其他rank类似。
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(
     RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size) {
@@ -228,13 +275,16 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(
   int stride = gridDim.x * blockDim.x;
   using P = typename packed_t<T>::P;
   using A = typename packed_t<T>::A;
-  int part = size / ngpus;
+  // <NT> 按rank数量均等分块，part是一块的数据量，start是每块的起始点。
+  // largest_part：如17份数据8个gpu，则有7个part为2，则有1个part为3. largest_part = (17+2) % 8 = 3
+  int part = size / ngpus;  
   int start = rank * part;
   int end = rank == ngpus - 1 ? size : start + part;
   int largest_part = part + size % ngpus;
   const P* ptrs[ngpus];
   P* tmps[ngpus];
 #pragma unroll
+  // <NT> rank3, 对应target会是34567012
   for (int i = 0; i < ngpus; i++) {
     int target = (rank + i) % ngpus;
     ptrs[i] = (const P*)_dp->ptrs[target];
@@ -275,9 +325,13 @@ class CustomAllreduce {
   int world_size_;
   bool full_nvlink_;
 
+  // <NT> 所有rank的同步信号
   RankSignals sg_;
+  // <NT> first是外部输入的显存地址指针，second是对应来自所有rank的peer指针，peer指针指向共享内存。
+  // 
   // Stores an map from a pointer to its peer pointters from all ranks.
   std::unordered_map<void*, RankData*> buffers_;
+  // <NT> 当前rank自身的同步信号
   Signal* self_sg_;
 
   // Stores rank data from all ranks. This is mainly for cuda graph purposes.
@@ -360,6 +414,15 @@ class CustomAllreduce {
   }
 
   /**
+   * <NT> d_rank_data_base_ 是构造时传入的普通显存地址，专门用于当前rank的普通指针到所有rank的共享指针的映射关系。
+   * (也参考python/sglang/srt/distributed/device_communicators/custom_all_reduce.py：create_shared_buffer， 当前rank留存的是普通指针，
+   * 其他rank的需要用cudaIpcGetMemHandle/cudaIpcOpenMemHandle额外处理)
+   * 输入参数 ptrs ，是 custom_all_reduce.py的buffer_ptrs，即是需要通信的目标数据的地址，一个小数组包含所有rank的共享内存地址，所以使用rank_data来存放这些指针数组。
+   * 因为这个映射关系只需要本地可见，所以用torch.empty申请空间即可。
+   * 
+   * buffers_的first是通信用的目标数据的当前rank的内存地址，second是目标通信数据的所有rank的共享内存地址(包含了自身的)。
+   * 实际使用时，输入当前rank的内存地址，就可以通过buffers_取得其对应的其他rank的对等的内存地址。直接基于这些内存进行规约操作即可。
+   * 
    * Register already-shared IPC pointers.
    */
   void register_buffer(void** ptrs) {
@@ -442,6 +505,7 @@ class CustomAllreduce {
     size /= d;
     auto bytes = size * sizeof(typename packed_t<T>::P);
     int blocks = std::min(block_limit, (size + threads - 1) / threads);
+    // <NT> 0是共享内存大小，指该kernel不需要动态分配共享内存，但不排除里面静态使用共享内存。
 #define KL(ngpus, name) name<T, ngpus><<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
     // TODO(hanzhi713): Threshold is different for A100 and H100.
     // Add per device threshold.

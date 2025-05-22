@@ -261,6 +261,7 @@ class CustomAllreduce:
             # Buffers memory are owned by this Python class and passed to C++.
             # Meta data composes of two parts: meta data for synchronization and a
             # temporary buffer for storing intermediate allreduce results.
+            # <NT> meta_size是Signal的size，
             self.meta_ptrs = self.create_shared_buffer(
                 ops.meta_size() + max_size, group=group
             )
@@ -308,17 +309,22 @@ class CustomAllreduce:
         Creates a shared buffer and returns a list of pointers
         representing the buffer on all processes in the group.
         """
+        # <NT> 申请显存，并使用cudaIpcGetMemHandle将该显存设置为多GPU共享，得到操作这块共享内存的句柄handle
         lib = CudaRTLibrary()
         pointer = lib.cudaMalloc(size_in_bytes)
         handle = lib.cudaIpcGetMemHandle(pointer)
         world_size = dist.get_world_size(group=group)
         rank = dist.get_rank(group=group)
         handles = [None] * world_size
+        # <NT> 使用allgather将各个gpu上的共享内存都收集起来，使每个gpu上都拿到所有gpu的分配的共享内存句柄。
         dist.all_gather_object(handles, handle, group=group)
 
+        # <NT> 如果是当前GPU自己的，则直接使用普通cudaMalloc出来的显存指针pointer.value，不需要额外操作.
+        #      但如果不是当前GPU的，是从其他GPU获取到的句柄，则需要额外调用cudaIpcOpenMemHandle，
+        #    它允许一个进程打开另一个进程导出的设备内存句柄，并在当前进程中使用该内存。
         pointers: List[int] = []
         for i, h in enumerate(handles):
-            if i == rank:
+            if i == rank:        
                 pointers.append(pointer.value)  # type: ignore
             else:
                 pointers.append(lib.cudaIpcOpenMemHandle(h).value)  # type: ignore

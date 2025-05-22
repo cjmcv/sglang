@@ -34,7 +34,10 @@ if _is_cuda or _is_hip:
 
 expert_distribution_recorder = ExpertDistributionRecorder()
 
-
+# <NT> topk_weights 和 topk_ids的维度都是[m, topk]
+# topk_ids: 每个 token 被分配给的 top-k 专家的索引，一行对应一个token，一个token选取topk个专家，每列存放一个专家的id号。
+# topk_weights: 每个 token 被分配给的 top-k 专家的权重, 表示该专家在该轮计算起到的作用的占比。
+#               用于在多个专家的输出之间进行加权求和。
 def fused_topk_native(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -49,7 +52,7 @@ def fused_topk_native(
         M, topk, dtype=torch.float32, device=hidden_states.device
     )
     topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
-    topk_weights = F.softmax(gating_output.float(), dim=-1)
+    topk_weights = F.softmax(gating_output.float(), dim=-1) # 门控分数转换为概率分布
     topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
@@ -263,7 +266,6 @@ def biased_grouped_topk(
 
 
 # <NT> 根据门控网络gate的输出，选择使用哪些专家
-# 大体有grouped_topk，biased_grouped_topk和fused_topk
 def select_experts(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,

@@ -359,6 +359,8 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
+    # <NT> 1) hidden_states 输入通过gate网络得到路由分数 router_logits，同时也经过共享专家得到共享专家的输出 shared_output。
+    #      2) 根据gate网络输出去选择专家，topk_idx和topk_weights都是[m,topk]，一行对应一个token，一列对应一个专家id及其在该轮计算的比重。
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_mode: ForwardMode
     ) -> torch.Tensor:
