@@ -508,6 +508,7 @@ class CustomAllreduce:
                 # gains of using custom kernels
                 return self.all_reduce_unreg(input)
             else:
+                # <NT> cuda graph的replay是已经被捕获到了，所以不会走这里。被捕获的将会是上面 registered=True 的
                 return self.all_reduce(input, registered=False)
 
     def close(self):

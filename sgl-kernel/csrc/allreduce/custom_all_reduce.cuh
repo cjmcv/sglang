@@ -389,6 +389,18 @@ class CustomAllreduce {
     return it->second;
   }
 
+  // <NT> 将capture时调用allreduce接口的输入的tensor的指针都保存在graph_unreg_buffers_，在结束capture后调用该函数，通过cudaIpcGetMemHandle将其设置为共享内存。
+  //  CU_POINTER_ATTRIBUTE_RANGE_START_ADDR 可以得到 ptr 指向的内存块的首地址 。
+  //  (内存需要是cudaMallocManaged申请的统一虚拟地址UVA 或 pytorch Tensor申请的显存(pytorch有封装相关信息)， 而不能是cudaMalloc申请的)。
+  //  比如用cudaMallocManaged申请了一大块内存，用 base_ptr 指定，然后基于地址偏移将内存划分成多块，充当多个tensor，
+  //  用每个块的首地址通过CU_POINTER_ATTRIBUTE_RANGE_START_ADDR都可以重新拿到偏移前的 base_ptr。
+  //
+  // handles存放基于首地址做内存共享得到的句柄，就是共享内存的首地址，偏移地址 - 首地址 = offset。共享内存的首地址加上偏移量就能拿到每个tensor在共享内存上的地址。
+  // 因为不是所有tensor都来自同一块大内存，所以graph_unreg_buffers_里首地址也会有很多个，个别元素是同一块内存不同offset，个别元素是不同内存块。
+  // 
+  // 调用链路：python/sglang/srt/distributed/device_communicators/custom_all_reduce.py
+  //     capture -> (final) register_graph_buffers -> ops.get_graph_buffer_ipc_meta(当前函数) -> ops.register_graph_buffers
+  //     即在capture结束后调用，capture中会通过下面 allreduce 的 status == cudaStreamCaptureStatusActive，将capture中输入的tensor全部加入到graph_unreg_buffers_中。
   std::pair<std::string, std::vector<int64_t>> get_graph_buffer_ipc_meta() {
     auto num_buffers = graph_unreg_buffers_.size();
     auto handle_sz = sizeof(cudaIpcMemHandle_t);
@@ -461,6 +473,11 @@ class CustomAllreduce {
         }
       }
     }
+    // <NT> 问：d_rank_data_base_在cuda graph的replay阶段，如何使用？
+    // 答：因为下面allreduce函数的流程在capture中已经被固化，所以不会再显式地运行。再replay时会严格按照capture中的流程进行运行。
+    // graph_unreg_buffers_的数量也已经被捕获到，所以在replay时，仍然可以看成是走if (status == cudaStreamCaptureStatusActive)的内容，
+    // 所以到了特定的调用位置，会有特定的graph_unreg_buffers_.size()，通过ptrs = d_rank_data_base_ + graph_unreg_buffers_.size()，
+    // 能够准确拿到特定调用位置的输入tensor对应的地址。
     CHECK_CUDA_SUCCESS(
         cudaMemcpy(d_rank_data_base_, rank_data.data(), sizeof(RankData) * num_buffers, cudaMemcpyHostToDevice));
     d_rank_data_base_ += num_buffers;
@@ -491,6 +508,8 @@ class CustomAllreduce {
     RankData* ptrs;
     cudaStreamCaptureStatus status;
     CHECK_CUDA_SUCCESS(cudaStreamIsCapturing(stream, &status));
+    // <NT> 当处于cuda graph正在capture中时，将外部提供的输入tensor加入到graph_unreg_buffers_中。
+    // rank_data 存放的是目标数据 从 当前rank的显存指针 映射到 所有rank的地址数组 的映射关系, 针对cuda graph直接用graph_unreg_buffers_.size()充当偏移量。
     if (status == cudaStreamCaptureStatusActive) {
       ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
       graph_unreg_buffers_.push_back(input);
