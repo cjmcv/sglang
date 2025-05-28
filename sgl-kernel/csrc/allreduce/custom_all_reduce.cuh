@@ -187,7 +187,11 @@ static DINLINE FlagType ld_flag_volatile(FlagType* flag_addr) {
 // <NT> sg是所有GPU的同步信号，self_sg是当前GPU自己的那一份，其实也包含在sg里，只是单独被指了出来。
 // threadIdx.x对应一个gpu，8个gpu则只有0-7号起作用。
 // blockIdx.x做第一维度索引，一个线程块负责一个块的数据拷贝，如果该block的0-7号线程对应的计数器都同步上了，则说明各个gpu上该block对应数据块已拷贝完毕。
-// 同步信号是整个通信类的成员变量，这样做可以防止，使用该通信类循环做多次通信时，因GPU通信轮次不一致，导致数据有误。
+// 同步信号是整个通信类的成员变量：
+//   通信前的同步：确保通信时各GPU的输入数据均已经准备好，如不同步，可能存在个别GPU的输入tensor内存里存放的是上一轮计算的数据，当前轮次的计算结果还未产生。
+//   通信后的同步：确保后续收取结果正确。1stage是单方面读取，读取完了自然就拿到了正确结果，但是自身共享内存的数据不能被修改，否则其他gpu可能会获取到异常数据，所以需要同步。
+//                但是共享内存的数据是输入数据，一般拿到输出后并不会改动输入数据，这种情况下1stage的实现可以不需要通信后的同步？
+//   
 //   按API调用方式：all_reduce(custom_ptr, inp1, out1, buffer_ptrs[rank], max_size)，buffer_ptrs已注册，循环调用时用的是同一个buffer（不同的输入也会被拷贝到该buffer）。
 //   如GPU_A完成了第一轮allreduce，想进入了第二轮通信，而GPU_B还在处理第一轮，因为如果两轮通信用的是同一份buffer，GPU_A在进入第二轮时没有等待GPU_A的第一轮结束，
 // GPU_B在第二轮开头就会覆盖IPC buffer(sgl-kernel/csrc/allreduce/custom_all_reduce.cu -> all_reduce -> cudaMemcpyAsync)，导致GPU_A的第一轮数据有冲突。
@@ -259,15 +263,23 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(
   multi_gpu_barrier<ngpus, false>(sg, self_sg, rank);
 }
 
+// <NT> Signal的内存是由sizeof(Signal)+max_size组成的，跃过sizeof(Signal)后剩下了都归通信算法用。
+// 对应的内存属于共享内存，可供其他GPU访问。
 template <typename P>
 DINLINE P* get_tmp_buf(Signal* sg) {
   return (P*)(((Signal*)sg) + 1);
 }
 
-// <NT> RingAllReduce的实现版本：ScatterReduce + Allgather
-// A[123456] B[abcdef] C[ijklmn] 数据被分成三部分: A[12,34,56] B[ab,cd,ef] C[ij,kl,mn]
-// A的part是0号，B的是1号，C是2号. 做allreduce后，A进行针对0号part得到[12abij,34,56], B[ab,34cdkl,ef], C[ij,kl,56efmn]，每个rank都有一个part的完整数据，
-// 然后allgather，A需要从B拿到1号part，从C拿到2号part，其他rank类似。
+// <NT> RingAllReduce的实现版本：ReduceScatter + Allgather
+// rank0[12345678] rank1[abcdefgh] rank2[ijklmnop] rank2[qrstuvwx] 数据被分成四部分: rank0[12,34,56,78] rank1[ab,cd,ef,gh] rank2[ij,kl,mn,op] rank3[qr,st,uv,wx]
+// rank0的part是0号，rank1的是1号... 做ReduceScatter后，rank0进行针对0号part得到[12abijqr,34,56], rank1[ab,34cdklst,ef]...，即rank0的part0是完整的，rank1的part1是完整的。
+// 每个rank都有一个part的完整数据，每个GPU收到来自3个GPU的1/4的数据，即1/4 * 3。
+// 然后allgather，rank0需要从rank1拿到1号part，从rank2拿到2号part，其他rank类似，每个GPU同样受到来自3个GPU的1/4的数据，两个阶段共2/4 * 3。
+// 回顾一阶算法，rank0收取其他3个GPU的4/4的数据，也是共4/4 * 3, 通信量减少1/2。
+// 
+// 同理，如有八个GPU，一阶：rank0收取其他7个GPU的全部数据，通信量是1*7；二阶：第一步rank0收取1/8 * 7，第二部rank0收取1/8 * 7，共2/8 * 7。通信量减少3/4.
+//       如有三个GPU，一阶：rank0收取其他2个GPU的全部数据，通信量是1*2；二阶：第一步rank0收取1/3 * 2，第二步rank0收取1/3 * 2，共2/3 * 2。通信量减少1/3.
+//       如有两个GPU，一阶：rank0通信量是1*1；二阶：第一步rank0收取1/2*1，第二步rank0收取1/2*1，共1. 通信量无变化。
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(
     RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size) {
@@ -284,7 +296,9 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(
   const P* ptrs[ngpus];
   P* tmps[ngpus];
 #pragma unroll
-  // <NT> rank3, 对应target会是34567012
+  // <NT> rank3, 对应target会是34567012 -> ptrs/tmps的下标就是0-7
+  //      rank4，对应target会是45670123，即rank3本地的tmp[0]是3号块数据，rank4本地的tmp[0]是4号块的数据。
+  //      每个rank负责自己的tmp[0]的reduce。当所有rank都把自己的tmp[0]处理完后，则rank3的tmps[0-7]都将会有数据，1-7是来自其他gpu的计算结果。
   for (int i = 0; i < ngpus; i++) {
     int target = (rank + i) % ngpus;
     ptrs[i] = (const P*)_dp->ptrs[target];
@@ -293,6 +307,9 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(
   auto tmp_out = tmps[0];
   multi_gpu_barrier<ngpus, true>(sg, self_sg, rank);
   // stage 1: reduce scatter
+  // <NT> 每个GPU只对自己负责的start到end的部分做reduce，
+  // 如rank3，对应的start/end是8等份的3号块，基于这第三号块将其余7个GPU的3号块收集起来，
+  // 即rank3的3号块数据将会是完整的。
   for (int idx = start + tid; idx < end; idx += stride) {
     tmp_out[idx - start] = packed_reduce<P, ngpus, A>(ptrs, idx);
   }
@@ -303,6 +320,10 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(
   // between threads that have the same tid. If thread i computes the sum of
   // start + i in the first stage, then thread i also gathers start + i from all
   // ranks.
+  // <NT> 第一层循环是从每个其他GPU拷贝的数据量
+  //      第二层循环是按前面reduce的结果，分别从rank0拷贝0号块，rank1拷贝1号块，rank2拷贝2号块。。。
+  //   如rank3，gather_from_rank会依次为34567012，对于gather_from_rank 3，dst_idx会定位到整体输出的3号块，从tmp[0]处将数据拷贝进去。
+  //   因为tmp[0]对应的就是rank3的数据。tmp[1-7]=>4567012
   for (int idx = tid; idx < largest_part; idx += stride) {
 #pragma unroll
     for (int i = 0; i < ngpus; i++) {
