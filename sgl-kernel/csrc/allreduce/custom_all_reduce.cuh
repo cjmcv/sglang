@@ -280,6 +280,9 @@ DINLINE P* get_tmp_buf(Signal* sg) {
 // 同理，如有八个GPU，一阶：rank0收取其他7个GPU的全部数据，通信量是1*7；二阶：第一步rank0收取1/8 * 7，第二部rank0收取1/8 * 7，共2/8 * 7。通信量减少3/4.
 //       如有三个GPU，一阶：rank0收取其他2个GPU的全部数据，通信量是1*2；二阶：第一步rank0收取1/3 * 2，第二步rank0收取1/3 * 2，共2/3 * 2。通信量减少1/3.
 //       如有两个GPU，一阶：rank0通信量是1*1；二阶：第一步rank0收取1/2*1，第二步rank0收取1/2*1，共1. 通信量无变化。
+//
+// 标准RingAllreduce 流程 https://zhuanlan.zhihu.com/p/69797852，该算法随GPU数量增加，其通信量不变，所以应具有线性加速能力！
+//
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(
     RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size) {
