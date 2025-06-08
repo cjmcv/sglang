@@ -754,6 +754,10 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             pass
 
 
+# <NT> 使用猴子补丁的方式，对custom_all_reduce_utils里的gpu_p2p_access_check函数进行修改，使其始终返回True
+# 即执行完第一个setattr后，其他地方调用gpu_p2p_access_check函数，都将会直接返回True。
+# 第二个setattr是将原本 CustomAllreduce 类中的 __del__ 方法被替换成了一个新的函数，
+# 这个新函数无论传入什么参数，都不会执行任何操作，直接返回 None。
 def monkey_patch_p2p_access_check():
     """
     Monkey patch the slow p2p access check.
@@ -771,7 +775,9 @@ def monkey_patch_p2p_access_check():
 
     setattr(CustomAllreduce, "__del__", lambda *args, **kwargs: None)
 
-
+# <NT> 针对gguf格式的猴子补丁，将量化方法的标准实现改成gguf的专属实现。
+# LinearBase             -> GGUFLinearMethod
+# VocabParallelEmbedding -> GGUFEmbeddingMethod
 def monkey_patch_vllm_gguf_config():
     try:
         from vllm.model_executor.layers.quantization.gguf import (
@@ -1500,7 +1506,10 @@ sglang_lib = Library("sglang", "FRAGMENT")  # noqa
 def supports_custom_op() -> bool:
     return hasattr(torch.library, "custom_op")
 
-
+# <NT> 此函数可直接注册一个自定义算子，并将其调度到 CUDA 后端。更多详细信息请参阅 https://gist.github.com/youkaichao/ecbea9ec9fc79a45d2adce1784d7a9a5。
+# 默认情况下，自定义算子会注册到 target_lib 或 sglang_lib。
+# 重要提示：算子的生命周期与库对象的生命周期相关联。如果你想将算子绑定到其他库，请确保在使用该算子时库对象处于存活状态。
+# fake_impl即伪实现，可用于模型调试、性能分析、编译优化等方面，使用伪实现替代繁重的真实实现，提高效率。
 def direct_register_custom_op(
     op_name: str,
     op_func: Callable,

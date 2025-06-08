@@ -83,6 +83,13 @@ fn slice_by_chars(s: &str, start: usize, end: usize) -> String {
 
 impl Tree {
     /*
+    <NT> 线程安全的多租户基数树，
+        针对每个worker/tenant都会基于历史请求信息在路由器端为其在近似基数树上维护自己的一份数据，
+    通过prefix_match找到最合适的tenant。
+    1. 为多个租户存储数据（多个基数树的重叠）
+    2. 节点级锁，以实现对节点的并发访问
+    3. 基于租户访问时间的叶子节点最近最少使用（LRU）淘汰机制
+
     Thread-safe multi tenant radix tree
 
     1. Storing data for multiple tenants (the overlap of multiple radix tree)

@@ -303,7 +303,24 @@ def _maybe_compile_deep_gemm_one_type_all(
         )
         thread_map(compile_func, collected_configs, max_workers=_COMPILE_WORKERS)
 
-
+# <NT> deepseek的moe计算过程: 
+#    1）计算前的数据：如有100个token，假设每个token特征长度为128，则原始数据维度是[100,128]。每层的路由专家权重部分共有256个专家，权重维度是[n,k]，则共有[256,n,k]的权重数据。
+#    2）在deepseek的moe计算中，topk被设为8，即表示每个token会选择8个专家网络进行计算。
+#    3）一个批次数据进行计算时并不会激活所有专家，如该批次的所有token共激活了20个专家（每个token选8个，所有token都选完后，只命中了这20个专家），
+#       即会对应有20个独立的gemm，则对应grouped_gemm中分组将会是20。B矩阵将会是这256个专家中被选出的20个专家的权重组合，每个专家对应一个组，即B矩阵维度是[20,n,k]
+#    4）A矩阵是输入数据，一行对应一个token，一个token选topk个专家，即一个token会参与这20个组中的8个组的计算, 即会重复出现8次，总数据量会是[100*topk, 128].
+#       应要与B矩阵的分组对应，m=100*topk里会有分组操作，与权重的分组一一对应。
+#
+# <NT> deepgemm的分组gemm计算kernel分了mask和continous两个，计算示意图：https://zhuanlan.zhihu.com/p/27867600492
+# mask api: A矩阵的维度会是[groups, max_m, k]，groups表示当前轮次被激活的专家数，max_m表示当前轮次计算，一个专家被分配最多的token数量，其他分组以该最大token数进行凑整。
+#           使每个组的m维度都被凑成max_m，但实际每个组的token数会小于等于max_m，所以需要有一个掩码来表示该group里m维度上哪些数据不需要被计算。
+#           masked_m参数：是一个长度为groups的tensor，里面存在的数据是对应每次group中，A矩阵不需要参与计算的部分。
+#           且A和B矩阵的分组顺序是一一对应摆放号的，A的0号group的数据对应B的0号group的数据。
+#      假设专家负载不均衡，某一个专家对应的token数很多，其他专家的很多，则max_m会比较大，稀疏性会很高。
+# continous api: A矩阵的每个token选topk个专家会参与topk个组的计算，即会重复topk次，维度是[m*topk，k]，也可以看成是[groups, (m*topk/groups), k]（实际是按[m*topk，k]排布的）。
+#                B矩阵同mask_api，而A矩阵是全部数据都参与计算的，没有填充没用数据，不需要masked_m去屏蔽数据。
+#                但因为需要知道A矩阵每行应该要对应哪个组，多设置了m_indices作为索引，长度为[m*topk]，里面一个元素表示A矩阵该行数据应对应哪个分组。
+#
 def grouped_gemm_nt_f8f8bf16_masked(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],

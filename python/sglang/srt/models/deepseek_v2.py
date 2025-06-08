@@ -16,7 +16,14 @@
 # https://github.com/vllm-project/vllm/blob/fb6af8bc086328ca6659e72d11ffd4309ce4de22/vllm/model_executor/models/deepseek_v2.py
 """Inference-only DeepseekV2 model."""
 
-import logging
+# <NT> huggingface的模型会由configuration_deepseek.py和modeling_deepseek.py两个文件组成，
+# configuration_deepseek.py：包含各种超参数和设置信息，这些信息决定了模型的架构、规模和行为。通过配置类，用户可以方便地对模型进行定制和调整；
+#                            https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/configuration_deepseek.py
+# modeling_deepseek.py：实现 DeepSeek 模型的具体架构和前向传播逻辑。它定义了模型的各个组件，如嵌入层、注意力层、前馈网络等，并将这些组件组合成完整的模型；
+#                       https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/modeling_deepseek.py
+# 如在ktransformer的实现，是在huggingface模型定义的基础上，将其中某些算子更换成自己的，从而达到优化的效果。
+# 当前的sglang模型文件主要对应上面modeling_deepseek.py。
+
 import os
 from enum import IntEnum, auto
 from typing import Any, Dict, Iterable, Optional, Tuple
@@ -142,6 +149,15 @@ class AttnForwardMethod(IntEnum):
     MLA_FUSED_ROPE = auto()
 
 
+# <NT> MLP层由gate_up_proj -> act_fn -> down_proj共两个线性层和一个激活层组成。
+# 其中第一个线性层gate_up_proj采用MergedColumnParallelLinear做TP，第二次线性层down_proj采用RowParallelLinear做TP。
+# gate_up_proj的ColumnParallelLinear是权重按列切分，负责的元素能完整计算完，后面还有其他层需要计算时，可以先不汇聚结果(all gather)。
+#     其输出维度是[intermediate_size] * 2，intermediate_size一般比hidden_size要大不少，在这输出维度大的情况下, 将输出结果汇总的代价较高，所以按列切分不汇总会更合适。
+# down_proj的RowParallelLinear是权重按行切分，负责的元素都没算完，需要对结果做allreduce, 以完成整个MLP的计算。因输出维度是hidden_size，较小，通信压力也小。
+#     其次，RowParallelLinear有参数input_is_parallel，即表示数据已经切分好了，可以直接在ColumnParallelLinear的结果上计算。
+#     反之，如果仍采用ColumnParallelLinear，它要求每个设备接收 完整的输入数据 进行计算，而前面的结果是已经将数据切分好了，要整合的话得多一次all gather通信才行。
+#     另外，输入维度是[intermediate_size] * 2，较大，占用的显存也会比较多。
+# 例子看srt/layers/linear.py, 层定义处。
 class DeepseekV2MLP(nn.Module):
     def __init__(
         self,
@@ -181,6 +197,7 @@ class DeepseekV2MLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. "
                 "Only silu is supported for now."
             )
+        # <NT> SiluAndMul会将输入[intermediate_size] * 2做silu后对位相乘合并，输出得到intermediate_size
         self.act_fn = SiluAndMul()
 
     def forward(self, x, forward_batch=None):
@@ -192,7 +209,16 @@ class DeepseekV2MLP(nn.Module):
         x, _ = self.down_proj(x)
         return x
 
-
+# <NT> 用于管理和控制专家混合（MoE）层中的专家路由。
+# 基本作用：
+#     专家选择：根据输入数据的特征，MoEGate决定将数据分配给哪些专家处理，确保每个输入由最合适的专家处理。
+#     负载均衡：MoEGate通过动态调整专家分配，防止某些专家过载或闲置，提升计算资源利用率。
+#     稀疏性控制：MoEGate通过限制每个输入激活的专家数量，保持模型的计算效率，避免激活过多专家导致计算成本上升。
+#     可扩展性：MoEGate支持动态增减专家数量，使模型能够灵活扩展，适应不同任务需求。
+# 其中的参数 config.n_routed_experts 指每个输入样本（或token）实际被路由到的专家数量，用于控制每个输入样本激活的专家数量。
+#           config.num_experts_per_tok 是指每个输入样本（或token）在路由过程中候选的专家数量。
+#           都涉及到了上面的负载均衡/稀疏性控制/可扩展性。
+# 本质上的实现就是一个线性层。
 class MoEGate(nn.Module):
     def __init__(
         self,
@@ -250,6 +276,16 @@ class DeepseekV2MoE(nn.Module):
 
         self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
 
+        # <NT> deepseek开源的deepep方案 / 原生的EP方案 / 原生的FusedMoE的TP方案
+        # n_routed_experts: 每个token实际被路由到的专家数量，无论是否采用EP，都需要用到。
+        # num_experts_per_tok: 每个token在路由过程中候选的专家数量
+        # moe_intermediate_size: 每个专家网络中中间层（Intermediate Layer）的隐藏单元数量，每个专家通常是一个独立的FFN。而这个参数就是这个FFN中间层的维度。
+        # n_group: 专家分组数量，对于每个输入样本，门控网络会为所有专家或专家组计算得分。选择得分较高的专家或专家组，通常选取topk（对应下面的topk_group）。
+        #          一旦确定了每个样本要使用的专家或专家组，就将样本输入到相应的专家网络进行计算。
+        #          1) 分组内专家并行计算：在每个选中的专家组内，各个专家可以并行地对分配给它们的样本进行处理，这样可以充分利用计算资源，提高计算效率。
+        #          2) 跨组计算协调：如果涉及多个专家组，需要对跨组的计算进行协调，确保每个样本都能得到正确的处理。
+        #          3) 根据门控分数，对各个专家的输出进行加权求和.
+        # e_score_correction_bias: 用于对专家选择的得分进行修正. 如由于数据分布不均，导致某些专家可能会被门控网络频繁选中，则可以用它来调整；
         self.experts = get_moe_impl_class()(
             num_experts=config.n_routed_experts
             + self.num_fused_shared_experts
@@ -274,6 +310,9 @@ class DeepseekV2MoE(nn.Module):
             ),
         )
 
+        # <NT> shared_experts 是指在MoE层中，所有输入样本共享的专家数量。
+        # 共享专家 与其他的普通专家不同之处在于，它会在gate门控网络前面执行，输入的是所有的隐层状态，即针对所有样本，通常用于学习输入数据中的通用特征。
+        # 而普通专家是在gate后，选择部分普通专家进行后续处理。
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # disable tp for shared experts when enable deepep moe
@@ -349,10 +388,13 @@ class DeepseekV2MoE(nn.Module):
         final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
+        # <NT> 这里tp_size > 1, 不仅只针对TP，对于EP而言tp_size也是大于1，启用EP时，ep_size=tp_size，且TP不使用。这里的MoE的TP和EP只能二选一。
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
+    # <NT> 1) hidden_states 输入通过gate网络得到路由分数 router_logits，同时也经过共享专家得到共享专家的输出 shared_output。
+    #      2) 根据gate网络输出去选择专家，topk_idx和topk_weights都是[m,topk]，一行对应一个token，一列对应一个专家id及其在该轮计算的比重。
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
@@ -678,6 +720,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         else:
             self.rotary_emb.forward = self.rotary_emb.forward_native
 
+        # <NT> 在权重吸收的模式下，kv的上采样被挪到了attention kernel后面，则进入到attention kernel的是压缩后的kv，
+        # 压缩后的kv只有一份，可以看作是所有q共享一个kv head，可采用mqa的kernel，即num_kv_heads=1。
+        # kv_lora_rank 是 LoRA 中低秩矩阵的秩（rank），决定了低秩矩阵的大小。
+        # head_dim 为 self.kv_lora_rank + self.qk_rope_head_dim, 即压缩后的矩阵维度加上应用rope后的矩阵维度。(deepseek中压缩的部分不应用rope，位置编码和非位置编码会区分开)
+        # 详情看: https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/lmsys_1st_meetup_deepseek_mla.pdf
         self.attn_mqa = RadixAttention(
             self.num_local_heads,
             self.kv_lora_rank + self.qk_rope_head_dim,
@@ -688,7 +735,9 @@ class DeepseekV2AttentionMLA(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn_mqa", prefix),
         )
-
+        # <NT> 普通模式下，进入到attention kernel前，kv会被上采样还原到压缩前的状态，
+        # num_kv_heads等于num_local_heads，则计算与mha一致，即有q和kv的head数量一致，一一对应，而不再是所有q对应一份kv。
+        # self.num_local_heads = num_heads // tp_size，在DeepSeek V3中num_heads是32。 
         self.attn_mha = RadixAttention(
             self.num_local_heads,
             self.qk_nope_head_dim + self.qk_rope_head_dim,
@@ -895,6 +944,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
 
+        # <NT> 单独将q的pe(位置编码)部分拿出来，需要计算rotary_emb 旋转位置编码，对应q的apply rope部分，算完后合并回去q，充当mha的q的输入。
         _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         latent_cache = latent_cache.unsqueeze(1)
@@ -921,6 +971,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         return q, k, v, forward_batch
 
     def forward_normal_core(self, q, k, v, forward_batch):
+        # <NT> 调用mha
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
@@ -963,6 +1014,9 @@ class DeepseekV2AttentionMLA(nn.Module):
             k_nope = latent_cache[..., : self.kv_lora_rank]
             k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
 
+        # <NT> 取出q_pe，需要进而计算位置编码 rotary_emb，对应weight_absorption中的q的apply rope部分
+        # 另外q_nope，需要跟先乘以w_kc，对应weight_absorption中的Wuc Linear1
+        # q_nope经过线性层得到的q_nope_out会跟q_pe经过rope计算结果合并在一起，充当mqa的q输入。
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
@@ -1219,6 +1273,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
+		# <NT> 需要多乘以w_vc，将维度升回去。对应weight_absorption中的Wuc Linear2
         if _is_hip:
             # TODO(haishaw): add bmm_fp8 to ROCm
             attn_bmm_output = torch.bmm(
@@ -1423,6 +1478,12 @@ class DeepseekV2DecoderLayer(nn.Module):
             is_previous_layer_sparse=is_previous_layer_sparse,
         )
 
+        # <NT> 
+        # config.n_routed_experts is not None 表示必须是MoE架构
+        # config.first_k_dense_replace 表示在模型从前 k 个全连接层开始，是否用某种特定的结构或操作替换原有的全连接层。这里的某种特定结构即MoE。
+        #                              如为0，表示所有mlp都是DeepseekV2MoE。为2，表示前面两层是DeepseekV2MLP，后面都是DeepseekV2MoE。
+        # config.moe_layer_freq 参数通常用于控制 MoE 层在模型中的分布频率，
+        #                       如为2，表示每隔 2 层插入一个 MoE 层。
         if self.is_layer_sparse:
             self.mlp = DeepseekV2MoE(
                 config=config,
@@ -1565,6 +1626,26 @@ class DeepseekV2DecoderLayer(nn.Module):
         return output
 
 
+# <NT> DeepseekV2Model定义
+# -> VocabParallelEmbedding 
+# -> for 多个相同的DeepseekV2DecoderLayer (数量是num_hidden_layers)
+#    -> RMSNorm
+#    -> DeepseekV2AttentionMLA - self attention
+#       -> forward_normal
+#       -> forward_absorb 权重吸收，
+#    -> RMSNorm
+#    -> DeepseekV2MoE + DeepseekV2MLP组合 (由first_k_dense_replace和moe_layer_freq两个参数控制组合情况,在V3和R1里都是分别为3和1) 
+#       <DeepseekV2MoE>
+#       -> shared_experts (DeepseekV2MLP类型，共享部分，每个样本都会进入计算)
+#       -> MoEGate        (门控网络，选择专家)
+#       -> experts, 有 EPMoE    (专家并行，一个节点存放部分专家) 
+#                   或 FusedMoE（所有专家混合在一起，然后用TP拆分每个专家网络的权重，打包做gemm）
+#       -> all reduce 专家结果 （无论是EP还是TP）
+#       <DeepseekV2MLP>
+#       ->  gate_up_proj - MergedColumnParallelLinear
+#       ->  act_fn       - SiluAndMul
+#       ->  down_proj    - RowParallelLinear - all reduce
+# -> RMSNorm
 class DeepseekV2Model(nn.Module):
     fall_back_to_pt_during_load = False
 
@@ -1888,6 +1969,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                         torch.bfloat16
                     )
 
+            # <NT> 注意到 w = self_attn.kv_b_proj.weight，即w_kc/w_vc是从升维恢复成多头的线性层的权重中拆分出来的。
             w_kc, w_vc = w.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
@@ -2065,6 +2147,9 @@ class DeepseekV2ForCausalLM(nn.Module):
                 "hnorm",
             ]
 
+        # <NT> DeepseekV2ForCausalLM本身就是一个大的torch.nn.Module.
+        # named_parameters 是 torch.nn.Module 类的一个方法，其主要作用是返回一个生成器，该生成器会迭代产生模型中所有可训练参数的名称以及对应的参数本身。
+        # 即会返回上面__init__(self)中所定义的可训练参数的名称和对应的参数张量信息。
         params_dict = dict(self.named_parameters())
         weight_names = []
         for name, loaded_weight in weights:
@@ -2118,6 +2203,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 param = params_dict[name]
+                # <NT> 如在MoE中create_weights时，会将权重加载函数通过set_weight_attrs，未为属性注册到nn.Module中。由这里取出每个层对应的加载函数，进行实际的加载操作。
+                # python/sglang/srt/layers/moe/ep_moe/layer.py#161
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -2220,6 +2307,12 @@ class DeepseekV2ForCausalLM(nn.Module):
         )
 
 
+# <NT> DeepSeek v3与v2在模型结构上完全一致，均使用了MoE和MLA，仅在参数上有所区别。
+#
+# V3 采用 FP8 训练，并开源了原生 FP8 权重，推理部署也更倾向于使用FP8。
+# R1 是基于 DeepSeek V3 模型进一步进行训练得到的，V3是通用型的大语言模型，R1 则是推理优先的模型，侧重于处理复杂的推理任务。
+# V3 总参数 6710 亿，每 token 激活 370 亿参数；R1 有不同规模的蒸馏版本，参数范围在 15 亿到 700 亿之间。
+#
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
     pass
 

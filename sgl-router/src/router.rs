@@ -29,6 +29,7 @@ fn copy_request_headers(req: &HttpRequest) -> Vec<(String, String)> {
 
 #[derive(Debug)]
 pub enum Router {
+    // <NT> 轮询，current_index记录当前节点，下次访问找下一个
     RoundRobin {
         worker_urls: Arc<RwLock<Vec<String>>>,
         current_index: AtomicUsize,
@@ -42,6 +43,18 @@ pub enum Router {
     },
     CacheAware {
         /*
+            <NT> 缓存感知的负载均衡路由器
+            里面包含有两种策略：1. 基于近似基数树的缓存感知的数据分发（当负载均衡时使用），
+                                 针对每个worker都会基于历史请求信息在路由器端为各个worker维护在近似基数树Tree内维护一份数据，树里存的是原始文本而不是token id，以免频繁调用tokenization。
+                                 abc. 每个新请求进来，会检索每个worker对应的树，找到一个具有最大的前缀匹配的。
+                                    如果匹配率大于阈值，则直接分发(缓存最相关)；如果小于等于阈值，则分发到树最小(可用缓存容量最大)的worker中。
+                                 d. 定期使用LRU(least recently used)清理叶子节点，防止内存溢出。
+                                 （近似基数树存在于分发处，用于分发前的检索；完整的基数树RadixCache存在于各个worker的Scheduler，用于实际的前缀处理）
+                              2. 最短队列的负载均衡（当负载不均衡时使用），将新请求分发到待处理请求数最少的worker中。
+            负载均衡的判断条件是：
+            1. (max - min) > abs_threshold，待处理请求数的最大值与最小值的绝对值差距大于阈值。
+            2. max > rel_threshold * min，待处理请求数的最小值乘以一个系数后仍比最大值小。
+
             Cache-Aware Load Balancing Router
 
             This router combines two strategies to optimize both cache utilization and request distribution:
@@ -102,12 +115,12 @@ pub enum Router {
             during the next eviction cycle.
         */
         worker_urls: Arc<RwLock<Vec<String>>>,
-        tree: Arc<Mutex<Tree>>,
+        tree: Arc<Mutex<Tree>>,   // Arc 是 Atomic Reference Counting，是一个智能指针，用于在多线程环境下实现多个所有者共享同一份数据
         running_queue: Arc<Mutex<HashMap<String, usize>>>,
         processed_queue: Arc<Mutex<HashMap<String, usize>>>,
         cache_threshold: f32,
-        balance_abs_threshold: usize,
-        balance_rel_threshold: f32,
+        balance_abs_threshold: usize,   // abs_threshold
+        balance_rel_threshold: f32,     // rel_threshold
         timeout_secs: u64,
         interval_secs: u64,
         _eviction_thread: Option<thread::JoinHandle<()>>,
@@ -125,10 +138,10 @@ pub enum PolicyConfig {
         interval_secs: u64,
     },
     CacheAwareConfig {
-        cache_threshold: f32,
-        balance_abs_threshold: usize,
-        balance_rel_threshold: f32,
-        eviction_interval_secs: u64,
+        cache_threshold: f32,          // 使用最高匹配路由所需的最小前缀匹配比率。低于此阈值时，将路由到缓存空间可用量最大的工作节点。
+        balance_abs_threshold: usize,  // abs_threshold
+        balance_rel_threshold: f32,    // rel_threshold
+        eviction_interval_secs: u64,   // 近似树的 LRU 逐出周期之间的间隔。
         max_tree_size: usize,
         timeout_secs: u64,
         interval_secs: u64,
@@ -385,6 +398,7 @@ impl Router {
         const MAX_TOTAL_RETRIES: u32 = 6;
         let mut total_retries = 0;
 
+        // <NT> MAX_TOTAL_RETRIES 是重复尝试次数。
         while total_retries < MAX_TOTAL_RETRIES {
             match self.select_first_worker() {
                 Ok(worker_url) => {

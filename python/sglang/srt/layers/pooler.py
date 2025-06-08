@@ -19,7 +19,13 @@ class PoolingType(IntEnum):
 class EmbeddingPoolerOutput:
     embeddings: torch.Tensor
 
-
+# <NT> 一个从隐藏状态中汇集特定信息的层。
+# （在qwen2模型中有使用，跟LogitsProcessor放在同一级别位置。
+#   python/sglang/srt/models/qwen2.py#357, 如果需要返回embedding数据，则调用它，否则调用LogitsProcessor）
+# 该层执行以下操作：
+#     根据pool方法提取特定标记或聚合数据。
+#     若有指定，则对输出进行归一化处理。
+#     将结构化结果以PoolerOutput的形式返回。
 class Pooler(nn.Module):
     """A layer that pools specific information from hidden states.
     This layer does the following:

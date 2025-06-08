@@ -179,6 +179,7 @@ class EmbeddingBatchResult:
     bid: int
 
 
+# <NT> 调度器，核心类，管理用于张量并行的GPUworker（不并行 / 张量并行 / 数据并行都会使用张量并行的tp_worker，不支持流水线并行）
 class Scheduler(
     SchedulerOutputProcessorMixin,
     SchedulerDisaggregationDecodeMixin,
@@ -197,9 +198,9 @@ class Scheduler(
     ):
         # Parse args
         self.server_args = server_args
-        self.tp_rank = tp_rank
+        self.tp_rank = tp_rank              # worker编号，0号worker有特殊功能工作 
         self.pp_rank = pp_rank
-        self.tp_size = server_args.tp_size
+        self.tp_size = server_args.tp_size  # worker数量
         self.pp_size = server_args.pp_size
         self.dp_size = server_args.dp_size
         self.schedule_policy = server_args.schedule_policy
@@ -229,6 +230,7 @@ class Scheduler(
         # Init inter-process communication
         context = zmq.Context(2)
         if self.pp_rank == 0 and self.attn_tp_rank == 0:
+            # <NT> scheduler 从 tokenizer 中接收数据
             self.recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
@@ -268,11 +270,17 @@ class Scheduler(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
             )[0]
 
+		# <NT> 只有生成式模型可以使用overlap模式，
         # Check whether overlap can be enabled
         if not self.is_generation:
             self.enable_overlap = False
             logger.info("Overlap scheduler is disabled for embedding models.")
+		# <NT> 如果使用了enable_overlap，则需要关闭jump_forward？
+        # jump_forward: https://lmsys.org/blog/2024-02-05-compressed-fsm/ (python/sglang/srt/constrained/xgrammar_backend.py#16)
+        # 在update_running_batch时，都会查找用于前跳解码的前跳字符串。这是当前匹配器状态下肯定符合当前语法的最长字符串。该字符串可以成为LLM的输出，而不需要LLM解码。
+        # overlap下，模型推理和其他操作会在不同线程上处理，jump_forward涉及到将batch中seq删除再重新加入的操作，会与推理线程存在同步问题？
 
+        # <NT> overlap模式下，会对TpModelWorker做进一步的封装，使用TpModelWorkerClient，里面会用到TpModelWorker作为成员worker
         # Launch a tensor parallel worker
         if self.enable_overlap:
             TpWorkerClass = TpModelWorkerClient
@@ -353,6 +361,13 @@ class Scheduler(
         # Init running status
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
+        # <NT> 连续批处理, 可在处理一个批次的请求时，动态地添加新的请求到批次中，而不必等待整个批次完成处理。
+        # 即running_batch在有数据需要处理时，会一直存在，动态更新添加新请求，并一直被计算。
+        # 每次循环中调用get_next_batch_to_run，保留上一轮batch中还需要继续计算的部分，从waiting_queue中获取新请求进行补充，更新到running_batch并进入run_batch。
+
+        # running_batch里存放的有新加入的extend或之前做了extend需要继续做decode的数据。
+        # waiting_queue里的都是全新的prefill数据或需要extend的数据。
+        # 
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
         self.cur_batch: Optional[ScheduleBatch] = None
@@ -484,6 +499,12 @@ class Scheduler(
         self.model_config = ModelConfig.from_server_args(server_args)
         self.is_generation = self.model_config.is_generation
 
+		# <NT> 在TokenizerManager/DetokenizerManager和TpModelWorker的初始化里也有这个操作
+        # 为什么多处地方都有这样的操作
+        # -- Scheduler 中的需要用语法限制decode输出，需要用到tokenizer
+        # -- TokenizerManager 需要用tokenizer来转化请求，送给Scheduler
+        # -- DetokenizerManager 同TokenizerManager，也需要用tokenizer来逆转换。
+        # -- TpModelWorker？TODO: 为什么也需要tokenizer？
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:
@@ -504,6 +525,21 @@ class Scheduler(
                     revision=server_args.revision,
                 )
 
+	# <NT> 如未明确指定chunked_prefill_size且未明确关闭RadixCache，则默认使用RadixCache。
+    # ChunkCache和RadixCache均是BasePrefixCache的派生类，管理req_to_token_pool和token_to_kv_pool.
+    # 但是ChunkCache没有实现prefix cache的功能，即不同seq之间无法共享前缀kvcache。
+    #
+    # ChunkCache：以req为主体，每个req维护一个列表，列表存放的是从req_to_token_pool检索得到其包含的token的kv_indices，
+    #             进而可以从token_to_kv_pool拿到对应的kvcache。
+    #             维护seq对应列表entry，基本等同于直接用req_to_token_pool，多包一层可能只是方便与radix接口对齐。
+    #             当seq结束时，会释放对应seq的entry/req_to_token_pool和token_to_kv_pool里所属token的内存。
+    #             所以如果后面出现的seq拥有与之前出现过的seq大体相同的前缀，因为之前的seq已经结束了，其对应的token的kvcache也释放了，
+    #             后来的seq将无法共享之前seq的token的kvcache了。
+    #          问：为什么要释放token_to_kv_pool里所属token的内存？回答见ChunkCache.cache_finished_req笔记。
+    #
+    # RadixCache：以token id为主体，构建基数树。采用LRU管理token_to_kv_pool里面以token节点为单位的kvcache，只有超时才会释放。
+    #             所以新seq到来，如拥有相同前缀，可以直接取到之前seq计算时留下的token的kvcache。实现prefix cache的功能。
+        
     def init_memory_pool_and_cache(self):
         server_args = self.server_args
 
@@ -675,9 +711,11 @@ class Scheduler(
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.result_queue = deque()
 
+        # <NT> Scheduler会一直循环从zmq接收来自TokenizerManager发送过来的请求，
+        # 安排组成batches进行推理计算，并将输出的tokens发送给DetokenizerManager。
         while True:
-            recv_reqs = self.recv_requests()
-            self.process_input_requests(recv_reqs)
+            recv_reqs = self.recv_requests()   # rank0通过zmq接收请求，并广播给其他tp_rank，同一组的tp_rank会有相同的数据。
+            self.process_input_requests(recv_reqs) # 根据请求指令做相关处理，该请求指令
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -688,6 +726,7 @@ class Scheduler(
                 self.result_queue.append((batch.copy(), result))
 
                 if self.last_batch is None:
+                    # <NT> 上一个batch为空，即表示当前batch是第一个batch，用一个
                     # Create a dummy first batch to start the pipeline for overlap schedule.
                     # It is now used for triggering the sampling_info_done event.
                     tmp_batch = ScheduleBatch(
@@ -974,12 +1013,17 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
         else:
+            # <NT> 在已有的session基础上，根据接收到的请求信息，创建新请求，送到worker的等待队列中。
+            # session里会包含所有它创建的历史请求。
             # Create a new request from a previous session
             session = self.sessions[recv_req.session_params.id]
             req = session.create_req(recv_req, self.tokenizer)
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self._add_request_to_queue(req)
                 return
+
+        # <NT> 来到这里，说明recv_req.session_id是None的。
+        # 填充新Req的各种信息，同时为该req初始化语法缓存(garmmar cache, 用于约束生成的词)
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
@@ -1037,6 +1081,7 @@ class Scheduler(
         # Init grammar cache for this request
         add_to_grammar_queue = False
         if (
+            # <NT> 需要是json或正则表达式才用, 从sampling_params中获取
             req.sampling_params.json_schema is not None
             or req.sampling_params.regex is not None
             or req.sampling_params.ebnf is not None
@@ -1294,7 +1339,13 @@ class Scheduler(
             self.metrics_collector.log_stats(self.stats)
         self._publish_kv_events()
 
+    # <NT> get_next_batch_to_run
+    # 1. 合并之前的extend/prefill batch里的还需要继续计算的部分（chunked prefill没算完的chunk，或prefill完还需要decode的）。
+    # 2. 调用get_new_batch_prefill，从waiting queue中获取新请求（如有），得到新的prefill/extend batch，并将当前的running batch打包在一起返回出去。
+    # 3. 如果没有新的prefill batch，则更新deocde的running batch并返回。
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        # <NT> 如果存在上一个计算的batch，且上一个batch是extend(或mixed)的，则说明该batch有没算完还需要继续计算的，这部分需要合并到当前的running_batch中。
+        # prefill/extend后面都还需要接decode计算。
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
         if self.chunked_req:
@@ -1318,6 +1369,7 @@ class Scheduler(
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
+			# <NT> 填入last_batch到running_batch中
             # Merge the new batch into the running batch
             if not self.last_batch.is_empty():
                 if self.running_batch.is_empty():
@@ -1326,6 +1378,12 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
 
+        # <NT> 获取一个new_batch: 
+        # 包含留下being_chunked_req中未完成的请求，
+        # 从waiting queue中获取新请求，填充PrefillAdder.can_run_list，并由ScheduleBatch.init_new生成一个新的batch
+        # bacth满了或者没有新的请求，get_new_batch_prefill会返回None，则会走下面的update_running_batch。
+        # get_new_batch_prefill有new_batch返回，则running_batch已经被混合到new_batch中了，running_batch不再需要update了。
+        # 从waiting queue中获取的都是新请求，都是prefill或extend的部分。
         new_batch = self.get_new_batch_prefill()
         if new_batch is not None:
             # Run prefill first if possible
@@ -1398,6 +1456,7 @@ class Scheduler(
             lora_set = set([req.lora_path for req in self.running_batch.reqs])
 
         # Get requests from the waiting queue to a new prefill batch
+        # <NT> 从waiting queue中拿到请求，由adder.add_one_req中放到can_run_list中暂存
         for req in self.waiting_queue:
             if (
                 self.lora_paths
@@ -1426,7 +1485,8 @@ class Scheduler(
                 None if prefix_computed else self.tree_cache,
                 self.enable_hierarchical_cache,
             )
-
+			
+			# <NT> 会赋值adder.new_being_chunked_req，并append can_run_list
             res = adder.add_one_req(
                 req, self.chunked_req, self.enable_hierarchical_cache
             )
@@ -1442,6 +1502,7 @@ class Scheduler(
                         self.running_batch.batch_is_full = True
                 break
 
+		# <NT> 去掉self.waiting_queue中已被填到can_run_list中的元素。
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
@@ -1482,6 +1543,7 @@ class Scheduler(
             self.server_args.enable_custom_logit_processor,
             chunked_req=self.chunked_req,
         )
+    	# <NT> self.forward_mode都会被置为extend
         new_batch.prepare_for_extend()
 
         # Mixed-style chunked prefill
@@ -1504,6 +1566,9 @@ class Scheduler(
 
         return new_batch
 
+    # <NT> 在get_next_batch_to_run里被调用。
+    # 输入参数self.running_batch里的都是用于解码的，update_running_batch也是专门用于处理decode的。
+    # 而prefill/extend部分在get_new_batch_prefill中处理，get_new_batch_prefill里可能会将prefill/extend的数据跟running_batch的decode数据进行混合打包。
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
@@ -1527,6 +1592,7 @@ class Scheduler(
                 f"#retracted_reqs: {len(retracted_reqs)}, "
                 f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
             )
+        	# <NT> 如果内存不够，会将选中的req重新放回到waiting_queue里，以后再计算
             self._extend_requests_to_queue(retracted_reqs)
         else:
             self.new_token_ratio = max(

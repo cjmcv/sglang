@@ -478,6 +478,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         """
         self.return_recv_hook = return_recv_hook
 
+    # <NT> 走grouped_gemm的 mask api.
+    # expected_m会充当m_grouped_gemm_fp8_fp8_bf16_nt_masked的参数输入，简化一下，取的是[m*topk]，buffer的group是process_group？todo
+    # 输入hidden_states和topk_idx，对hidden_states数据进行重拍，使其适应mask_api的A矩阵，重拍方式使用的是Buffer的函数，而Buffer取自deepep。
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
@@ -505,6 +508,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             hook,
         )
 
+    # <NT> B矩阵不需要调整？
     def dispatch_b(
         self,
         hidden_states,
@@ -668,11 +672,14 @@ class DeepEPDispatcher:
             deepep_mode=deepep_mode,
         )
 
+        # <NT> low_latency走grouped_gemm的 mask api。
+        # dispatcher里主要有dispatch_a/b 和 combine_a/b 四个函数，dispatch是在专家网络计算前调用，combine是计算后调用
         if self.deepep_mode.enable_low_latency():
             self._low_latency_dispatcher = _DeepEPDispatcherImplLowLatency(
                 return_recv_hook=return_recv_hook,
                 **common_kwargs,
             )
+        # <NT> normal走grouped_gemm的 continous api
         if self.deepep_mode.enable_normal():
             self._normal_dispatcher = _DeepEPDispatcherImplNormal(
                 async_finish=async_finish,

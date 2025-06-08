@@ -71,6 +71,24 @@ class LoRAManager:
 
         self.init_loras()
         self.init_lora_memory_pool()
+        
+		# <NT> 老版实现方式：flashinfer里实现的分段矩阵乘法。
+        # 里面会按分段后分别进行矩阵.
+        # def run(
+        #     self,
+        #     x: torch.Tensor,
+        #     weights: torch.Tensor,
+        #     batch_size: int,
+        #     weight_column_major: bool,
+        #     seg_lens: Optional[torch.Tensor] = None,
+        #     seg_indptr: Optional[torch.Tensor] = None,
+        #     weight_indices: Optional[torch.Tensor] = None,
+        # ) -> torch.Tensor:
+        # x是A矩阵，weights是B矩阵，batch_size表示分多少片（一个seq一片），
+        # weight_column_major表示B矩阵是否为列优先，对于fc层的gemm不是常规的gemm，B矩阵应该为列优先。
+        # seg_lens，其实也是seq_len，是一个列表，里面每个元素表示该下标对应的片段长度（对应行数）。
+        # seg_indptr，列表，表示每个seq的起始行号。
+        # weight_indices，B矩阵每个分片的buffer id号。与 self.A_buffer[lora_weight_name][i][buffer_id] 中的[buffer_id]对应。
 
     def init_cuda_graph_batch_info(self, max_bs_in_cuda_graph: int):
         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
@@ -89,6 +107,8 @@ class LoRAManager:
                 scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
             )
 
+    # <NT> 1. 基于给定的lora_path，获取配置文件和目标module，configs和target_modules都是有多份的，对应不同的模块。
+    #      2. 每个目标模块分配一个LoRAAdapter，并初始化权重 initialize_weights。self.loras的元素都是 LoRAAdapter 
     def init_loras(self):
         # Config of each LoRA adapter
         self.configs: Dict[str, LoRAConfig] = {}
@@ -132,9 +152,23 @@ class LoRAManager:
             assert all(x.hf_config["r"] == max_lora_dim for x in self.configs.values())
             assert all(x.scaling == scaling for x in self.loras.values())
 
+
+        # <NT> monkey patch：即 “猴子补丁”，是一种在运行时动态修改代码的技术。
+        # 将普通层替换层绑定了lora的层： set_lora_module-> get_lora_layer(如 MergedColumnParallelLinear 替换成 MergedColumnParallelLinearWithLoRA) / replace_submodule
+        # 绑定了lora层的新层会先运行原来的层base_layer，然后额外运行lora部分计算。目前只有VocabParallelEmbedding和各种Linear层。
+        # 把基础模型的对应层都替换成了lora层后，模型正常计算即可完成lora的计算。
+        # 问：模型层已替换完成，如何跟seq绑定？
+        # 答：看QKVParallelLinearWithLoRA的set_lora_info，ForwardBatch在构建的时候，如果服务初始化时有指定了lora（model_runner.server_args.lora_paths），会进而调用lora_manager.prepare_lora_batch。
+        #     prepare_lora_batch 会判断 forward_batch.lora_paths是否存在，forward_batch.lora_paths是由req绑定并传入的，req有就有，没有就没有。
+        #     如果req需要计算lora，会激活在服务初始化时就加载好的对应lora模块的计算数据，并进一步调用到 set_lora_info 确定需要计算lora，送入相应lora模块数据进行计算。
+        # 
+        # 总之，服务启动时，会设置要支持的lora模块，并完成加载和模型层的替换(普通层换成带lora的层)，但带lora的层不一定都会计算lora，
+        #       需要看送入的req是否有指定lora模块（req与lora一一绑定，lora模块需要是在服务启动时设置的lora模块里所包含的），req有指定，则计算，没指定则不计算。
         # Convert original model layers to layers with LoRA
         self.convert_to_lora_layers()
 
+    # <NT> lora内存池，里面包含A和B矩阵的内存分配。
+    # 各个目标模块里的A矩阵如大小一致者，会复用内存。B矩阵亦然。
     def init_lora_memory_pool(self):
         # Initialize memory pool
         self.memory_pool = LoRAMemoryPool(
@@ -150,6 +184,11 @@ class LoRAManager:
         # Initialize target lora modules in memory pool
         self.memory_pool.init_buffers(self.lora_weight_names, self.base_model)
 
+    # <NT> lora batch，即是多个lora模块组合而成的一个batch。因为每个lora模块里，针对相同的类型和层id，其权重维度都一样。
+    # 可以把这些权重放到一起使用segment_gemm来一起计算。
+    # prepare_lora_batch是通过server_args.lora_paths判断调用的，但具体该batch是否需要计算lora，需要cur_uids不为空。
+    # cur_uids首先由forward_batch.lora_paths指定，是通过 req.lora_path -> ScheduleBatch.get_model_worker_batch -> ModelWorkerBatch -> ForwardBatch得到的。
+    # 即 cur_uids 与req绑定，req有指定就有，没指定就不计算。
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
         # load active loras into lora memory pool
         cur_uids = set(forward_batch.lora_paths)
@@ -223,6 +262,9 @@ class LoRAManager:
         self.lora_backend.set_batch_info(batch_info)
 
         # call set_lora_info for each lora modules
+        # <NT> ab buffer都是按lora模块，层类型，层id三个索引进行划分。对于同类型和同id，不同lora模块的数据可以一起算。
+        # 如 self.A_buffer[lora_weight_name][i][buffer_id]， 里面的[buffer_id]会跟lora模块一一对应。
+        # 所以计算时，seg_indptr分a矩阵，weight_indices分b矩阵。各自单独计算gemm。搜 self.segment_gemm = SegmentGEMMWrapper(workspace_buffer) 看参数定义
         for layer_id, modules in self.lora_modules.items():
             for module_name, module in modules:
                 if "qkv_proj" in module_name:

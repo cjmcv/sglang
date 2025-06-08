@@ -103,6 +103,7 @@ def get_hf_text_config(config: PretrainedConfig):
         return config
 
 
+# <NT> 从模型文件夹中读取配置文件config.json并添加一些其他信息。
 def get_config(
     model: str,
     trust_remote_code: bool,

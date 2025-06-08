@@ -261,7 +261,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
     forward_native = forward_cuda
 
-
+# <NT> w1/w3是合并列并行的线性层, 由两个层合并成一个层做linear, 起到gate_up_proj (即gate_proj和up_proj两个线性层) 的作用，TP并行需要使用MergedColumnParallel, 
+#      w2是单一的线性层，接到w13的列并行后面，做行并行规约结果。基础实现看 moe_forward_native。
 class FusedMoE(torch.nn.Module):
     """FusedMoE layer for MoE models.
 
@@ -322,6 +323,10 @@ class FusedMoE(torch.nn.Module):
         self.top_k = top_k
         self.num_experts = num_experts
         assert intermediate_size % self.tp_size == 0
+        # <NT> 在ep中是num_experts_per_partition，按专家分。这里是按intermediate_size_per_partition，按权重分。
+        # 所以这里的TP是所有节点都会有每个专家网络的一部分。对MLA分发数据做DP，然后all gather，并推送到每个节点上计算MoE。
+        # 完了后slice开，与分发的数据相对应，得到结果。https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models 
+        # 无论门控网络选择了哪些专家，每个节点都会参与计算，不会存在节点闲置情况。
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
         self.reduce_results = reduce_results
         self.renormalize = renormalize
@@ -686,6 +691,10 @@ class FusedMoE(torch.nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
         )
 
+        # <NT> TP下，上面的每层的权重矩阵切分后，矩阵乘计算的就是矩阵的分块，需要将各节点的分块都reduce到一起。
+        # 结果是叠加，所以是all reduce，而不是all gather。
+        # MQ: 里面有一个RowParallelLinear，所以需要all reduce？列划分需要all gather。这里默认self.reduce_results为False，是因为外面也有一个all reduce，所以里面不做了。
+        #     这样看FusedMoE和EPMoE都需要做一次all reduce，通信量一致？
         if self.reduce_results and self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 

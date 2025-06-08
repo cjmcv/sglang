@@ -205,6 +205,20 @@ class LogitsMetadata:
         self.gathered_buffer = gathered_buffer
 
 
+# <NT> 对模型输出的对数（logits）进行后处理，
+# 对数（logits）是模型在输出层经过线性变换后得到的原始分数，尚未经过 Softmax 函数转换为概率分布。
+# LogitsProcessor 的作用就是在将这些 logits 转换为概率之前，对其进行修改和调整，以实现特定的文本生成控制目标。
+# 主要功能，如：
+#   约束生成结果：通过对 logits 进行处理，可以限制模型生成的文本范围，例如避免生成一些不合法、不恰当或者不符合任务要求的词汇。
+#   控制生成风格：可以根据不同的需求调整生成文本的风格，如生成更保守、多样化或者更具创造性的文本。
+#   提高生成质量：通过过滤掉不合理的词汇或者调整词汇的得分，提高生成文本的质量和连贯性。
+# 常见类型及实现方式：
+#   * 重复词惩罚处理器（RepetitionPenaltyLogitsProcessor）
+#     对已经出现过的词汇的 logits 进行惩罚，通常是将其得分乘以一个小于 1 的惩罚因子。避免生成重复的内容，使生成的文本更加多样化。
+#   * 最大长度处理器（MaxLengthLogitsProcessor）
+#     检查当前生成的文本长度，如果达到最大长度，修改 logits 的值。
+#   * 词汇过滤处理器（ForcedBOSTokenLogitsProcessor、ForcedEOSTokenLogitsProcessor 等）
+#     将指定词汇的 logits 设置为一个非常大的值，同时将其他词汇的 logits 设置为一个相对较小的值，使得指定词汇在经过 Softmax 后具有极高的概率被选中
 class LogitsProcessor(nn.Module):
     def __init__(
         self, config, skip_all_gather: bool = False, logit_scale: Optional[float] = None

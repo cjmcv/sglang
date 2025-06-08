@@ -40,6 +40,10 @@ if _is_cuda or _is_hip:
     from sgl_kernel import topk_softmax
 
 
+# <NT> topk_weights 和 topk_ids的维度都是[m, topk]
+# topk_ids: 每个 token 被分配给的 top-k 专家的索引，一行对应一个token，一个token选取topk个专家，每列存放一个专家的id号。
+# topk_weights: 每个 token 被分配给的 top-k 专家的权重, 表示该专家在该轮计算起到的作用的占比。
+#               用于在多个专家的输出之间进行加权求和。
 def fused_topk_native(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -54,6 +58,7 @@ def fused_topk_native(
         M, topk, dtype=torch.float32, device=hidden_states.device
     )
     topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
+    # 门控分数转换为概率分布
     topk_weights = F.softmax(gating_output.float(), dim=-1)
     topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
     if renormalize:
@@ -114,6 +119,9 @@ def _fused_topk_postprocess(
 
 
 # This is used by the Deepseek V2/V3/R1 series models
+# <NT> 对门控网络输出计算softmax，然后按分组计算每组的分数，以每组的最高值来取topk的组。
+# 并构建掩码筛选出得分较高的部分的权重及其下标。
+# torch.topk返回的是topk的数值和下标，dim=-1表示沿着最后一个维度，如果是二维向量，则dim=-1是列，即从列方向找出每一行的topk个元素及其下标，维度是[n, k], 行数n不变，列是topk的k。
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def grouped_topk(
     hidden_states: torch.Tensor,
@@ -132,6 +140,9 @@ def grouped_topk(
     scores = torch.softmax(gating_output, dim=-1)
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
+    # <NT> view是按分组num_expert_group，重新调整分数矩阵的维度，-1即最后一个维度的连续排布的分数是一组的
+    # max(dim=-1).values，即在最后一个维度上取最大值。
+    # group_scores的维度将会是[num_token, num_expert_group], 里面每个元素表示一组内所有专家的分数的最高值。
     group_scores = (
         scores.view(num_token, num_expert_group, -1).max(dim=-1).values
     )  # [n, n_group]
@@ -314,6 +325,7 @@ def biased_grouped_topk(
         )
 
 
+# <NT> 根据门控网络gate的输出，选择使用哪些专家
 def select_experts(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
