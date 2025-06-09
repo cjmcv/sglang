@@ -791,6 +791,19 @@ class DeepseekV2AttentionMLA(nn.Module):
             else:
                 return AttnForwardMethod.MLA
 
+        # <NT> flashinfer和FA3里实现的都是最底层的attention kernel，对应RadixAttention类型的 attn_mha / attn_mqa 的forward实现kernel。
+        # 实际mla是更外层的概念，包含了 低秩压缩、动态稀疏、位置编码适配 三大核心创新，这里MLA层会包含这些内容，在经过各种处理后，才调用 attn_mha 或 attn_mqa 的计算kernel。
+        # 1）将原始高维KV矩阵投影至低秩潜在空间，生成联合压缩的隐向量 cKV（隐层状态经过线性层就得到cKV#搜 kv_a_proj_with_mqa ），
+        #    仅需存储压缩后的隐向量，extend阶段通过线性变换重建原始KV，使用mha计算。decode阶段采用权重吸收优化，全程采用cKV。
+        # 2）轻量级网络实时预测各注意力头对当前输入的贡献度，仅保留贡献度最高的头部，关闭低效计算单元。（代码中未体现？）
+        # 3）将Query/Key的RoPE维度与非RoPE维度解耦，RoPE仅作用于部分维度，确保压缩后潜在向量仍携带位置感知能力。
+        #
+        # <NT> MLA在prefill/extend模式下会进入普通模式采用MHA实现，在decode阶段进入MLA的权重吸收模式采用MQA实现.
+        # 原因: https://zhuanlan.zhihu.com/p/1897225385751585767
+        #    1) 在prefill阶段，矩阵吸收后，MQA的HeadDim变为576+512，MHA使用pad后的vheadDim192，所以有（576 + 512）/（192+192）=2.833 ，
+        #                     如果MHA的V不使用pad，则MQA实现相比MHA实现：（576+512) / (192+128)=3.4。所以MQA相比MHA的实现方式，计算量更大。
+        #                     所以MQA相比MHA的实现方式，计算量更大。
+        #    2) 在decode阶段，q为1，MQA的计算量会小于MHA，序列越长收益越大。
         if self.attention_backend == "flashinfer":
             # Flashinfer MLA: Do not absorb when enabling ragged prefill
             if (
@@ -945,10 +958,12 @@ class DeepseekV2AttentionMLA(nn.Module):
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
 
         # <NT> 单独将q的pe(位置编码)部分拿出来，需要计算rotary_emb 旋转位置编码，对应q的apply rope部分，算完后合并回去q，充当mha的q的输入。
+        # qk_nope_head_dim：不参与位置编码的维度=>低秩投影路径； qk_rope_head_dim：参与RoPE旋转的维度=>位置敏感路径
         _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         latent_cache = latent_cache.unsqueeze(1)
         kv_a = self.kv_a_layernorm(kv_a.contiguous())
+        # <NT> 从 低秩 到 原始维度的重建，用于后面的mha
         kv = self.kv_b_proj(kv_a)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope = kv[..., : self.qk_nope_head_dim]

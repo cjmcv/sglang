@@ -274,6 +274,7 @@ def merge_state_v2_wrapper(o, s_a, o_exp, s_b):
     return merge_state_v2(o, s_a, o_exp, s_b)
 
 
+# <NT> 针对MLA，在prefill/extend阶段会使用MHA，decode阶段会使用MQA。
 class FlashAttentionBackend(AttentionBackend):
     """FlashAttention backend implementation.
 
