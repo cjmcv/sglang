@@ -600,7 +600,7 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
         return 1.0
     return 0.1 * mscale * math.log(scale) + 1.0
 
-
+# <NT> 模型中MLA的参数值: https://zhuanlan.zhihu.com/p/25449691772
 class DeepseekV2AttentionMLA(nn.Module):
 
     def __init__(
