@@ -77,6 +77,9 @@ def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
     return config.index_n_heads
 
 
+# <NT> 在TpModelWorker的初始化中被构建
+# context_length: 可以通过server_args.context_length设置，表示模型能够处理的输入token数量。
+#                 如果不填，会从下面的hf_config中取出derived_context_len并覆盖，即读取模型文件配套的config文件，即每个模型固定。
 class ModelConfig:
     def __init__(
         self,
@@ -547,6 +550,7 @@ class ModelConfig:
             # Default to FP8 for backward compatibility
             return {"quant_method": "modelopt_fp8"}
 
+    # <NT> 确认启用的量化方案，此时self.quantization可以为空，即用户未显式指定。
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _verify_quantization(self) -> None:
         supported_quantization = [*QUANTIZATION_METHODS]
@@ -593,6 +597,10 @@ class ModelConfig:
         # Parse quantization method from the HF model config, if available.
         quant_cfg = self._parse_quant_hf_config()
 
+        # <NT> 如gptq模型，在这里遍历QUANTIZATION_METHODS，当 _ = 'gptq_marlin' 时，会取到 GPTQMarlinConfig (直接用vllm的)，
+        # 里面的 override_quantization_method 会根据配置信息确认能否使用gptq_marlin, 如何符合条件，就转成gptq_marlin.
+        # 继而会得到quantization_override='gptq_marlin'，从而将 self.quantization 设置为 gptq_marlin，走的不再是普通的gptq方案.
+        # 如果用户指定 quantization='gptq', 则 override_quantization_method 函数里会判断认为不做override, 仍采用用户指定的gptq方案
         if quant_cfg is not None:
             quant_method = quant_cfg.get(
                 "quant_method", "" if not self.quantization else self.quantization
@@ -805,7 +813,7 @@ def _get_and_verify_dtype(
 
     return torch_dtype
 
-
+# <NT> 只有下面列的几项不是生成式模型，其他的基本都是
 def is_generation_model(model_architectures: List[str], is_embedding: bool = False):
     # We have two ways to determine whether a model is a generative model.
     # 1. Check the model architecture
@@ -892,6 +900,9 @@ def is_audio_model(model_architectures: List[str]):
     return False
 
 
+# <NT> decoder-only：常用于自然语言生成任务，目的式生成连贯、有逻辑的文本。如常见的qwen/llama/gpt等NLP类模型，大多采用decoder-only架构。
+#      encoder-decoder：常用于序列到序列的转换任务，如机器翻译，文本摘要，语音识别等。
+#                     或多模态中，会对不同模态的数据进行编码
 def is_encoder_decoder_model(model_architectures: List[str]):
     return "MllamaForConditionalGeneration" in model_architectures
 

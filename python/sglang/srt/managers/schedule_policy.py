@@ -101,6 +101,7 @@ class SchedulePolicy:
             disable=False,
         )
 
+    # <NT>按预设策略,重排waiting_queue, 并检索前缀是否已被计算
     def calc_priority(self, waiting_queue: List[Req]) -> bool:
         if self.policy == CacheAgnosticPolicy.FCFS:
             if self.enable_priority_scheduling:
@@ -175,6 +176,9 @@ class SchedulePolicy:
         self.waiting_queue_radix_tree.reset()
 
         for r in waiting_queue:
+            # <NT> 获取最长前缀的token id集，并根据token id集通过match_prefix找到这些token在kvcache中的存放位置。
+            # radix cache中不需要输入rid，里面组件基数树，只有节点和token的概念，不与req绑定。
+            # chunk cache中需要输入rid，里面会根据req来存放kvcache的存放位置。
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
 
@@ -319,11 +323,11 @@ class PrefillAdder:
         page_size: int,
         tree_cache: BasePrefixCache,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-        running_batch: ScheduleBatch,
+        running_batch: ScheduleBatch,     # <NT> 当前输入running_batch是之前计算留下的seq，即全是decode的
         new_token_ratio: float,
         rem_input_tokens: int,
         rem_chunk_tokens: Optional[int],
-        mixed_with_decode_tokens: int = 0,
+        mixed_with_decode_tokens: int = 0,  # <NT> chunked prefill中一个chunk顺带的deocde数量
         priority_scheduling_preemption_threshold: int = 0,
     ):
         self.page_size = page_size

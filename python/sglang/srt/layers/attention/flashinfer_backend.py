@@ -399,6 +399,10 @@ class FlashInferAttnBackend(AttentionBackend):
             ),
         )
 
+    # <NT> 在每次推理前会调用一次，设置相关的信息。
+    #  针对speculative decoding则无论是draft模型推理阶段还是目标模型检验阶段，都使用PrefillMetadata。
+    # speculative decoding中在draft模型(草稿模型/小模型)里做extend。
+    #  针对普通的decode/idle，都用DecodeMetadata。针对普通的prefill/extend都用PrefillMetadata。    
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
@@ -1537,6 +1541,7 @@ class FlashInferMultiStepDraftBackend:
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
 
 
+# <NT> fp8直接使用tensorcore，fp16或bf16需要gqa_group_size大于4？其他情况不使用tensorcore。
 def should_use_tensor_core(
     kv_cache_dtype: torch.dtype,
     num_attention_heads: int,

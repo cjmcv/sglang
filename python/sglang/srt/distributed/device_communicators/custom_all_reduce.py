@@ -173,6 +173,7 @@ class CustomAllreduce:
             # Buffers memory are owned by this Python class and passed to C++.
             # Meta data composes of two parts: meta data for synchronization and a
             # temporary buffer for storing intermediate allreduce results.
+            # <NT> meta_size是Signal的size，
             self.meta_ptrs = self.create_shared_buffer(
                 ops.meta_size() + max_size, group=group
             )
@@ -211,6 +212,12 @@ class CustomAllreduce:
 
         self.disabled = False
 
+	# <NT> 申请显存，并使用cudaIpcGetMemHandle将该显存设置为多GPU共享，得到操作这块共享内存的句柄handle
+	# 使用allgather将各个gpu上的共享内存都收集起来，使每个gpu上都拿到所有gpu的分配的共享内存句柄。
+	#   如果是当前GPU自己的，则直接使用普通cudaMalloc出来的显存指针pointer.value，不需要额外操作.
+    # 但如果不是当前GPU的，是从其他GPU获取到的句柄，则需要额外调用cudaIpcOpenMemHandle，
+    # 它允许一个进程打开另一个进程导出的设备内存句柄，并在当前进程中使用该内存。
+        
     @staticmethod
     def create_shared_buffer(
         size_in_bytes: int, group: Optional[ProcessGroup] = None
@@ -407,6 +414,7 @@ class CustomAllreduce:
                 # gains of using custom kernels
                 return self.all_reduce_unreg(input)
             else:
+                # <NT> cuda graph的replay是已经被捕获到了，所以不会走这里。被捕获的将会是上面 registered=True 的
                 return self.all_reduce(input, registered=False)
 
     def close(self):

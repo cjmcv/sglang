@@ -30,6 +30,9 @@ class FlashAttentionMetadata:
 
     For each init metadata function, we will try set up them in below order
     """
+    # <NT> 针对每个ForwardBatch在计算前都需要为其构建一个Metadata，然后每个attention层共享。
+    # cache_seqlens_int32: 当前ForwardBatch的
+
 
     # Sequence lengths for the forward batch
     cache_seqlens_int32: torch.Tensor = None
@@ -56,6 +59,16 @@ class FlashAttentionMetadata:
     # Page table for the encoder
     encoder_page_table: torch.Tensor = None
 
+    # <NT> Local attention 局部注意力：MHA/GQA/MQA/MLA本身都属于全局注意力，
+    # 但可以通过滑窗(SlidingWindow)/掩码(Masking)/分块(Chunking)实现局部注意力的效果。
+    # 这里主要通过跟 attn_chunk_size / attention_chunk_size 变量关联。
+    # 在LLaMA2的Dual Chunk Attention (DCA)，LLaMA的Chunk Attention都会用到。
+    # 
+    # <NT> FlashAttentionBackend里还有一个参数 window_size / layer.sliding_window_size, 需要与attention_chunk_size区分开.
+    # sliding_window_size: 表示每个 token 在计算注意力时可以关注的局部上下文范围。具体来说，每个 token 只会与它左侧和右侧的一定数量的 token 计算注意力分数.
+    #                      通过限制每个 token 的注意力范围，sliding_window_size 能够显著减少计算复杂度，同时保留局部上下文信息。
+    #                      是一个固定大小的窗口，围绕每个 token 滑动, 如qwen2模型中有使用. 也是local attention中的一种。(但是与这里实现的use_local_attn无关联)
+    # attention_chunk_size: 一种将输入序列划分为多个固定大小的块（chunk）的机制，每个块内的 token 之间可以进行注意力计算, 如LLaMA模型中有使用. 
     @dataclass
     class LocalAttentionMetadata:
         local_query_start_loc: torch.Tensor = None  # cu_seqlens_q for local attention
@@ -280,6 +293,15 @@ def merge_state_v2_wrapper(o, s_a, o_exp, s_b):
     return merge_state_v2(o, s_a, o_exp, s_b)
 
 
+# <NT> 针对MLA，在prefill阶段会使用MHA，decode/extend阶段会使用MQA。
+# 在flash attention中：
+# q和k的是headdim, v的是headdim_v, 二者不一定相同, q和k的headdim可能会包含有rope_dim。
+# q的是nheads, k和v的是nheads_k, MHA时二者相同, GQA/MQA中, k和v的nheads_k会比q的要少。
+# 在deepseekv3中, 在普通模式下用MHA, q和k维度[seqlen, nheads, nope_dim+rope_dim], 
+#                                     v维度[seqlen, nheads, nope_dim].
+#                 权重吸收模式下用MQA, q维度[seqlen, nheads, nope_dim+rope_dim], 
+#                                     k维度[seqlen, 1, nope_dim+rope_dim], 
+#                                     v维度[seqlen, 1, latent_dim].
 class FlashAttentionBackend(AttentionBackend):
     """FlashAttention backend implementation.
 
@@ -315,6 +337,16 @@ class FlashAttentionBackend(AttentionBackend):
         ), "Sliding window and cross attention are not supported together"
 
         self.forward_metadata: FlashAttentionMetadata = None
+        # <NT> 投机解码，相关联的关键变量有： （关联笔记'<NT> Draft Decode')
+        # * FlashAttentionMultiStepBackend: 用于draft worker，里面会启动多个FlashAttentionBackend。
+        #                                   而原来的FlashAttentionBackend会用于target verify. 普通模式就只有一个FlashAttentionBackend.
+        # * forward_metadata_spec_decode_expand: 投机解码用的metadata. 在use_cascade_attn内使用.
+        # * speculative_num_steps: 有多少step，FlashAttentionMultiStepBackend里就会有多少个FlashAttentionBackend。
+        # * speculative_num_draft_tokens
+        # * topk: 初始化固定，model_runner.server_args.speculative_eagle_topk
+        # * is_target_verify(): 表示该batch走投机解码的校验模式。
+        # * use_cascade_attn: if forward_batch.forward_mode.is_target_verify() and self.topk > 1，会额外多调用一次attention
+        # 
         # extra metadata for handling speculative decoding topk > 1, extended draft decode and verify
         self.forward_metadata_spec_decode_expand: FlashAttentionMetadata = None
         self.max_context_len = model_runner.model_config.context_len
@@ -369,6 +401,12 @@ class FlashAttentionBackend(AttentionBackend):
         batch_size = forward_batch.batch_size
         device = seqlens_in_batch.device
 
+        # <NT> Draft Decode: 草稿解码是推测解码(speculative Decoding)的一部分，使用一个较小的
+        #             草稿模型（Draft Model）快速生成多个候选 Token， 然后由目标模型（Target Model）进行验证和修正。
+        #             因为会生成多个Token，所以会带有topk的参数。
+        #             使top-k设置为1时，草稿模型会生成一个概率最高的 Token。目标模型会对这个Token 
+        #             进行验证，可能会选择相同的 Token，也可能选择不同的 Token。
+        #      Normal Decode: 传统的自回归解码方式，每次生成一个 Token，依赖于之前已经生成的所有 Token
         if forward_batch.forward_mode.is_decode_or_idle():
             # Draft Decode
             if forward_batch.spec_info is not None:
@@ -755,6 +793,9 @@ class FlashAttentionBackend(AttentionBackend):
             max_seqlen_q = metadata.max_seq_len_q
             cu_seqlens_k = metadata.cu_seqlens_k
 
+        # <NT> Extend阶段，如果非mla，采用flash_attn_with_kvcache；
+        #                     是mla，是权重吸收阶段，采用flash_attn_with_kvcache；
+        #                            非权重吸收阶段，采用flash_attn_varlen_func；？？
         # Use Flash Attention for prefill
         if not self.use_mla:
             # Do multi-head attention
@@ -952,6 +993,7 @@ class FlashAttentionBackend(AttentionBackend):
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+    # <NT> decode阶段，均采用 flash_attn_with_kvcache
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -2330,6 +2372,7 @@ class FlashAttentionMultiStepBackend:
                 )
             )
 
+    # <NT> 对ForwardBatch进行推理计算前都需要调用init_forward_metadata，每计算一次构建一次仅，针对当前batch。
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata(forward_batch)

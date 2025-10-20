@@ -60,6 +60,8 @@ def disk_cache(expire: Optional[float] = None, typed=False, ignore=()):
 
 @disk_cache()
 def init_state_to_jump_forward(regex_string):
+    # <NT> regex 是 正则表达式(regular expression) 的缩写
+    #      interegular 是 正则表达式 操作模块？
     try:
         regex_pattern = interegular.parse_pattern(regex_string)
     except InvalidSyntax as e:

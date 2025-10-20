@@ -44,7 +44,8 @@ from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
 logger = logging.getLogger(__name__)
 
-
+# <NT> 在进行逐层从host加载数据到device时使用。
+# 使用了条件变量，在加载完成后调用increment，调用get_key_buffer/get_value_buffer消费时调用wait_until。
 class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
@@ -94,6 +95,10 @@ class LayerDoneCounter:
         self.consumer_index = -1
 
 
+# <NT> 缓存管理操作，里面将host_indices和device_indices相关联。
+# merge: 将其他CacheOperation合并进来，包括索引/优先级和节点id，用于批量处理。
+# split：将CacheOperation拆分成多个小的，以减小中间buffer的大小。
+#       factor是分裂系数，需要大于1，如为2，则对半分成两个，为5则每份是1/5，分成5份。
 class CacheOperation:
 
     counter = 0
@@ -141,6 +146,8 @@ class HiCacheAck(NamedTuple):
     node_ids: List[int]
 
 
+# <NT> TransferBuffer, 重叠缓冲区准备操作和传输操作，以提高吞吐量。
+# stop_event 会是一个threading.Event()，用于停止推送数据。
 class TransferBuffer:
     """
     Overlapping buffer preparation and transfer operations to improve throughput.
@@ -331,6 +338,7 @@ class HiCacheController:
         ]:
             raise ValueError(f"Invalid write policy: {write_policy}")
 
+        # <NT> PriorityQueue：是一个优先队列，入队的元素会被赋予一个优先级，出队时优先级最高的元素会最先被取出
         # self.write_queue = PriorityQueue[CacheOperation]()
         self.load_queue: List[CacheOperation] = []
         self.write_queue: List[CacheOperation] = []
@@ -419,6 +427,10 @@ class HiCacheController:
             self.prefetch_thread.start()
             self.backup_thread.start()
 
+    # <NT> 从host端分配token空槽位，并将这些新的空槽位保护起来，因为拷贝是异步的，以免中途再次被修改。
+    # 将host_indices和device_indices使用CacheOperation关联起来，表示这是同一批数据。
+    # 需要将host_indices上的host数据转移到device_indices上的device显存中。
+    # write执行后，write_queue会有数据，而初始化时创建的write_thread就会接收到数据，异步执行拷贝操作。
     def write(
         self,
         device_indices: torch.Tensor,
@@ -465,6 +477,8 @@ class HiCacheController:
 
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
 
+    # <NT> 与上面的write相对应，用于将数据从host端加载数据到device。
+    # load对应load_queue, 对应load_thead.
     def load(
         self,
         host_indices: torch.Tensor,

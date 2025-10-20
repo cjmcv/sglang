@@ -11,6 +11,12 @@
 using fptr_t = int64_t;
 static_assert(sizeof(void*) == sizeof(fptr_t));
 
+// <NT> allreduce 算法的初始化函数，ar是allreduce的缩写。
+// fake_ipc_ptrs是python端传入的meta，包含所有rank的共享内存(自身rank的是cudaMalloc申请的，其他rank是cudaIpcGetMemHandle)，
+//              每份大小是 sizeof(Signal) + max_size, sizeof(Signal)存放的是同步用的Signal， max_size部分存放的是allreduce算法的一些中间结果。
+// rank_data是本地使用torch.empty申请的显存空间，存放的是目标数据 从 当前rank的显存指针 映射到 所有rank的地址数组 的映射关系。
+//          当一份数据需要通信，要先调用到create_shared_buffer为其申请显存空间，同时获取得到其他rank的对等共享内存地址，然后注册到 buffers_ 里。
+//          实际通信时，接口传入当前rank的内存地址，通过buffers_得到所有rank的共享内存地址，然后在这些地址上进行数据操作。
 fptr_t
 init_custom_ar(const std::vector<fptr_t>& fake_ipc_ptrs, torch::Tensor& rank_data, int64_t rank, bool full_nvlink) {
   int world_size = fake_ipc_ptrs.size();
